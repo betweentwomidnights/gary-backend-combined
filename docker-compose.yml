@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  web:
+    image: thecollabagepatch/concurrent_gary:fixed
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - mongo
+    environment:
+      - WORKERS=4
+
+  redis:
+    image: "redis:alpine"
+    ports:
+      - "6378:6379"
+
+  mongo:
+    image: "mongo:latest"
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  express-server:
+    image: thecollabagepatch/express-server:latest
+    ports:
+      - "3000:3000"
+
+volumes:
+  mongo-data:

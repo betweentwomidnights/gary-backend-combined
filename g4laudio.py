@@ -1,5 +1,3 @@
-# g4laudio.py
-
 import torchaudio
 import torch
 import numpy as np
@@ -7,9 +5,7 @@ from audiocraft.models import MusicGen
 from audiocraft.data.audio import audio_write
 import base64
 import io
-
 import uuid
-
 import torchaudio.transforms as T
 
 def generate_session_id():
@@ -40,7 +36,7 @@ def wrap_audio_if_needed(waveform, sr, desired_duration):
         current_duration = waveform.shape[-1] / sr
     return waveform
 
-def process_audio(input_data_base64, model_name):
+def process_audio(input_data_base64, model_name, progress_callback=None, prompt_duration=6):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
@@ -65,6 +61,7 @@ def process_audio(input_data_base64, model_name):
 
     # Load the model
     model_continue = MusicGen.get_pretrained(model_name)
+    model_continue.set_custom_progress_callback(progress_callback)
 
     # Setting generation parameters
     output_duration = song_resampled.shape[-1] / expected_sr
@@ -74,10 +71,9 @@ def process_audio(input_data_base64, model_name):
         top_p=0.0,
         temperature=1.0,
         duration=output_duration,
-        cfg_coef=3.0
+        cfg_coef=3.0,
     )
 
-    prompt_duration = 8.0  # The desired prompt duration in seconds
     # Ensure the input waveform is long enough
     prompt_waveform = wrap_audio_if_needed(processed_waveform, expected_sr, prompt_duration + output_duration)
     prompt_waveform = prompt_waveform[..., :int(prompt_duration * expected_sr)]
@@ -93,7 +89,7 @@ def process_audio(input_data_base64, model_name):
 
     return output_data_base64
 
-def continue_music(input_data_base64, musicgen_model):
+def continue_music(input_data_base64, musicgen_model, progress_callback=None, prompt_duration=6):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
@@ -106,6 +102,7 @@ def continue_music(input_data_base64, musicgen_model):
         song = song.repeat(2, 1)  # Make stereo if mono
 
     model_continue = MusicGen.get_pretrained(musicgen_model)
+    model_continue.set_custom_progress_callback(progress_callback)
     model_continue.set_generation_params(
         use_sampling=True,
         top_k=250,
@@ -116,7 +113,6 @@ def continue_music(input_data_base64, musicgen_model):
     )
 
     # Generate continuation
-    prompt_duration = 5.0  # in seconds
     prompt_waveform = song[:, -int(prompt_duration * sr):]
     output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
     output = output.squeeze(0) if output.dim() == 3 else output  # Ensure 2D tensor for audio

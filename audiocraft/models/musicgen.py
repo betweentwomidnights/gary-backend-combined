@@ -169,9 +169,13 @@ class MusicGen:
             'two_step_cfg': two_step_cfg,
         }
 
-    def set_custom_progress_callback(self, progress_callback: tp.Optional[tp.Callable[[int, int], None]] = None):
-        """Override the default progress callback."""
-        self._progress_callback = progress_callback
+    def set_custom_progress_callback(self, progress_callback):
+        def internal_progress_callback(current_step, total_steps):
+            if current_step % 50 == 0:  # Emit progress every 50 steps
+                if progress_callback:
+                    progress_callback(current_step, total_steps)
+        
+        self._progress_callback = internal_progress_callback
 
     def generate_unconditional(self, num_samples: int, progress: bool = False,
                                return_tokens: bool = False) -> tp.Union[torch.Tensor,

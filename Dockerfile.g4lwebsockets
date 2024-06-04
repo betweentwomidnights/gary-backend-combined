@@ -1,0 +1,53 @@
+# Use a CUDA-enabled base image with Ubuntu 20.04
+FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu20.04
+
+# Set the working directory
+WORKDIR /usr/src/app
+
+# Install necessary packages including Python 3.9 and pip
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.9 \
+    python3.9-distutils \
+    wget \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pip for Python 3.9
+RUN wget https://bootstrap.pypa.io/get-pip.py && python3.9 get-pip.py && rm get-pip.py
+
+# Install setuptools and wheel
+RUN python3.9 -m pip install --upgrade pip
+RUN python3.9 -m pip install setuptools wheel
+
+# Copy the requirements file into the container
+COPY requirements-g4lwebsockets.txt ./
+
+# Install Python dependencies
+RUN python3.9 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt
+
+# Verify gunicorn installation and list installed packages
+RUN python3.9 -m pip show gunicorn
+RUN python3.9 -m pip list
+
+# Copy the entire audiocraft folder
+COPY audiocraft /usr/src/app/audiocraft
+
+# Explicitly install PyTorch with CUDA support
+# RUN python3.9 -m pip install torch==2.1.0+cu117 -f https://download.pytorch.org/whl/torch_stable.html
+# RUN python3.9 -m pip install torchaudio==2.1.0
+
+# Copy the current directory contents (excluding audiocraft which is already copied)
+COPY . .
+
+# Copy entrypoint.sh and make it executable
+COPY entrypoint.sh /usr/src/app/entrypoint.sh
+RUN chmod +x /usr/src/app/entrypoint.sh
+
+# Make port 8000 available to the world outside this container
+EXPOSE 8000
+
+# Use the entrypoint.sh script
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]

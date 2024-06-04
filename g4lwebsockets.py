@@ -10,16 +10,23 @@ from bson.objectid import ObjectId
 from pydantic import BaseModel, ValidationError
 
 # MongoDB setup
-client = MongoClient('mongodb://localhost:27018/')
+# THIS IS THE LOCAL VERSION
+# client = MongoClient('mongodb://localhost:27017/')
+client = MongoClient('mongodb://mongo:27017/')
 db = client['audio_generation_db']
 sessions = db.sessions
 fs = GridFS(db)
 
 # Redis setup
-redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+# THIS IS THE LOCAL VERSION
+# redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 
 app = Flask(__name__)
-socketio = SocketIO(app, message_queue='redis://localhost:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
+# THIS IS THE LOCAL VERSION
+# socketio = SocketIO(app, message_queue='redis://localhost:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
+socketio = SocketIO(app, message_queue='redis://redis:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
 
 @app.route('/')
 def index():
@@ -110,6 +117,13 @@ def handle_audio_processing(data):
                 result_base64 = process_audio(input_data_base64, model_name, progress_callback, prompt_duration=prompt_duration)
                 store_audio_data(session_id, result_base64, 'last_processed_audio')
                 emit('audio_processed', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
+
+                # Acknowledgment mechanism
+                @socketio.on('acknowledge_audio_processed')
+                def handle_acknowledge(data):
+                    ack_session_id = data.get('session_id')
+                    if ack_session_id == session_id:
+                        print(f"Audio processed acknowledgment received for session: {session_id}")
             except Exception as e:
                 emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
             finally:
@@ -148,6 +162,13 @@ def handle_continue_music(data):
                 store_audio_data(session_id, last_processed_base64, 'last_input_audio')  # Store last input used for continuation
                 store_audio_data(session_id, result_base64, 'last_processed_audio')  # Update last processed with new continuation
                 emit('music_continued', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
+
+                # Acknowledgment mechanism
+                @socketio.on('acknowledge_music_continued')
+                def handle_acknowledge(data):
+                    ack_session_id = data.get('session_id')
+                    if ack_session_id == session_id:
+                        print(f"Music continued acknowledgment received for session: {session_id}")
             except Exception as e:
                 emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
             finally:
@@ -185,6 +206,13 @@ def handle_retry_music(data):
                 store_audio_data(session_id, last_input_base64, 'last_input_audio')
                 store_audio_data(session_id, result_base64, 'last_processed_audio')
                 emit('music_retried', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
+
+                # Acknowledgment mechanism
+                @socketio.on('acknowledge_music_retried')
+                def handle_acknowledge(data):
+                    ack_session_id = data.get('session_id')
+                    if ack_session_id == session_id:
+                        print(f"Music retried acknowledgment received for session: {session_id}")
             except Exception as e:
                 emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
             finally:
@@ -197,7 +225,8 @@ def handle_retry_music(data):
 @socketio.on('update_cropped_audio')
 def handle_update_cropped_audio(data):
     try:
-        session_id = data.get('session_id')  # Use get method to safely retrieve session_id
+        request_data = SessionRequest(**data)
+        session_id = request_data.session_id
         audio_data_base64 = data.get('audio_data')  # Use get method to safely retrieve audio_data
         if session_id and audio_data_base64:
             store_audio_data(session_id, audio_data_base64, 'last_processed_audio')

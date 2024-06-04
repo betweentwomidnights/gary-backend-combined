@@ -1,5 +1,3 @@
-# g4laudio.py
-
 import torchaudio
 import torch
 import numpy as np
@@ -7,6 +5,12 @@ from audiocraft.models import MusicGen
 from audiocraft.data.audio import audio_write
 import base64
 import io
+import uuid
+import torchaudio.transforms as T
+
+def generate_session_id():
+    """Generate a unique session ID."""
+    return str(uuid.uuid4())
 
 # Function to normalize audio to a target peak amplitude
 def peak_normalize(y, target_peak=0.9):
@@ -32,7 +36,7 @@ def wrap_audio_if_needed(waveform, sr, desired_duration):
         current_duration = waveform.shape[-1] / sr
     return waveform
 
-def process_audio(input_data_base64, model_name):
+def process_audio(input_data_base64, model_name, progress_callback=None, prompt_duration=6):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
@@ -57,6 +61,7 @@ def process_audio(input_data_base64, model_name):
 
     # Load the model
     model_continue = MusicGen.get_pretrained(model_name)
+    model_continue.set_custom_progress_callback(progress_callback)
 
     # Setting generation parameters
     output_duration = song_resampled.shape[-1] / expected_sr
@@ -66,10 +71,9 @@ def process_audio(input_data_base64, model_name):
         top_p=0.0,
         temperature=1.0,
         duration=output_duration,
-        cfg_coef=3.0
+        cfg_coef=3.0,
     )
 
-    prompt_duration = 6.0  # The desired prompt duration in seconds
     # Ensure the input waveform is long enough
     prompt_waveform = wrap_audio_if_needed(processed_waveform, expected_sr, prompt_duration + output_duration)
     prompt_waveform = prompt_waveform[..., :int(prompt_duration * expected_sr)]
@@ -85,54 +89,49 @@ def process_audio(input_data_base64, model_name):
 
     return output_data_base64
 
-def continue_music(input_data_base64, musicgen_model):
+def continue_music(input_data_base64, musicgen_model, progress_callback=None, prompt_duration=6):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
 
-    # Load the input audio ensuring consistent channel layout and format
     song, sr = torchaudio.load(input_audio)
-    song = song.cuda()  # Move the tensor to GPU for processing
+    song = song.to('cuda')  # Assume CUDA is available and preferred
 
-    # Ensure the audio is stereo if the original audio is mono
+    # Normalize audio channels
     if song.size(0) == 1:
         song = song.repeat(2, 1)  # Make stereo if mono
 
-    # Load the model and set generation parameters
     model_continue = MusicGen.get_pretrained(musicgen_model)
+    model_continue.set_custom_progress_callback(progress_callback)
     model_continue.set_generation_params(
         use_sampling=True,
         top_k=250,
         top_p=0.0,
         temperature=1.0,
-        duration=30,  # This is the output duration for the continuation part
+        duration=30,  # Set duration explicitly
         cfg_coef=3.0
     )
 
-    prompt_duration = 6.0  # The duration of audio to use for generating continuation
-
-    # Slice the last 'prompt_duration' seconds of audio to use as a prompt
+    # Generate continuation
     prompt_waveform = song[:, -int(prompt_duration * sr):]
-
-    # Generate the continuation
     output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
+    output = output.squeeze(0) if output.dim() == 3 else output  # Ensure 2D tensor for audio
 
-    # Remove the extra batch dimension from output if necessary
-    if output.dim() == 3:
-        output = output.squeeze(0)  # Remove batch dimension if exists
+    # Resample output if necessary
+    if sr != 32000:
+        resampler = T.Resample(orig_freq=32000, new_freq=sr).to('cuda')
+        output = resampler(output)
 
-    # Ensure the output has the same number of channels as the original
-    if output.size(0) != song.size(0):
-        output = output.repeat(song.size(0), 1)  # Match the channel count to the original
-
-    # Debug: Check shapes
-    print(f"Original shape: {song.shape}, Output shape: {output.shape}")
-
-    # Combine the original audio minus the prompt with the generated continuation
+    # Ensure all tensors are on the same device and have the same number of channels
     original_minus_prompt = song[:, :-int(prompt_duration * sr)]
-    combined_waveform = torch.cat([original_minus_prompt, output], dim=1)  # Concatenate along the time axis
+    if original_minus_prompt.size(0) != output.size(0):
+        # Adjust channel numbers if needed
+        output = output.repeat(original_minus_prompt.size(0), 1)
 
-    # Convert the combined tensor to a byte buffer
+    # Concatenate tensors
+    combined_waveform = torch.cat([original_minus_prompt, output], dim=1).to('cuda')
+
+    # Save output
     output_audio = io.BytesIO()
     torchaudio.save(output_audio, format='wav', src=combined_waveform.cpu(), sample_rate=sr)
     output_audio.seek(0)

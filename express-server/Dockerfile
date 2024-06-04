@@ -10,6 +10,9 @@ COPY package*.json ./
 # Install any needed packages specified in package.json
 RUN npm install
 
+# Update the package list and install ffmpeg
+RUN apt-get update && apt-get install -y ffmpeg
+
 # Bundle the app source inside the Docker image
 COPY . .
 

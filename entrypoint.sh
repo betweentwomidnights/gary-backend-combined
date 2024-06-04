@@ -1,7 +1,8 @@
-#!/bin/bash
+#!/bin/sh
+# entrypoint.sh
 
-# Start the RQ worker in the background
-rq worker &
+# Exit immediately if a command exits with a non-zero status
+set -e
 
-# Start the main application
-exec gunicorn --workers=4 --timeout=240 concurrent_gary:app --bind 0.0.0.0:8000
+# Execute the gunicorn command
+exec gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 4 -t 300 --graceful-timeout 30 g4lwebsockets:app --bind 0.0.0.0:8000

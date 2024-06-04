@@ -1,1 +1,40 @@
 express-server/
+commune/
+g4l/
+/express-server
+
+# Ignore the commune directory
+/commune
+/g4l
+/g4c
+
+# Ignore the node_modules directory (if applicable)
+/node_modules
+
+# Ignore Python cache files and directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore logs and temp files
+*.log
+*.tmp
+
+# Ignore version control directories
+.git
+.hg
+.svn
+
+# Ignore Docker-related files
+Dockerfile*
+docker-compose.yml
+
+# Ignore other large or unnecessary directories and files
+/tmp/
+*.tar.gz
+*.zip
+*.whl
+
+# Ignore any other specific files or directories
+# Add any other large files or directories specific to your project

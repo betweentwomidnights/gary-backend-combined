@@ -1,6 +1,6 @@
 import os
 import base64
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import yt_dlp as youtube_dl
 import torch
@@ -9,38 +9,44 @@ from audiocraft.models import MusicGen
 from audiocraft.data.audio import audio_write
 import torchaudio.transforms as T
 from concurrent.futures import ThreadPoolExecutor
-from flask import current_app as app
 import json
 import librosa
 import soundfile as sf
 
-from rq import Queue
+from rq import Queue, Retry
 from redis import Redis
 
-from pymongo import MongoClient
+from pymongo import MongoClient, errors
 
 from bson import ObjectId, json_util
 import bson  # Import bson to handle bson-related errors
-from flask import Response
-
-from bson.objectid import ObjectId  # Add this import statement
-
-from urllib.parse import urlparse
 import re
 
+from g4laudio import continue_music
 
 
-# Establish a connection to the MongoDB server
-client = MongoClient('mongodb://localhost:27018/')
+# MongoDB connection with retry logic
+def get_mongo_client():
+    try:
+        client = MongoClient('mongodb://mongo:27017/', serverSelectionTimeoutMS=60000)
+        client.admin.command('ping')  # Check if the connection is established
+        return client
+    except errors.ConnectionFailure as e:
+        print(f"Could not connect to MongoDB: {e}")
+        return None
 
-# Select your database
-db = client['name']
+client = get_mongo_client()
+if client:
+    db = client['name']
+    audio_tasks = db.audio_tasks
+else:
+    print("Failed to connect to MongoDB.")
 
-# For example, use the 'audio_tasks' collection
-audio_tasks = db.audio_tasks
 
-# After
-redis_conn = Redis(host='localhost', port=6379)
+# Redis connection
+redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
+print(f"Connecting to Redis at '{redis_url}'")
+redis_conn = Redis.from_url(redis_url)
 q = Queue(connection=redis_conn)
 
 app = Flask(__name__)
@@ -126,14 +132,16 @@ def load_and_preprocess_audio(file_path, timestamp, promptLength):
   return prompt_waveform, sr
 
 def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration):
+    # Calculate the duration to end at a bar
+    duration = calculate_duration(bpm, min_duration, max_duration)
 
-   # Calculate the duration to end at a bar
-   duration = calculate_duration(bpm, min_duration, max_duration)
-
-   model_continue = MusicGen.get_pretrained(model)
-   model_continue.set_generation_params(use_sampling=True, top_k=250, top_p=0.0, temperature=1.0, duration=duration, cfg_coef=3)
-   output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
-   return output.cpu().squeeze(0)
+    # Use a new CUDA stream for this task
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        model_continue = MusicGen.get_pretrained(model)
+        model_continue.set_generation_params(use_sampling=True, top_k=250, top_p=0.0, temperature=1.0, duration=duration, cfg_coef=3)
+        output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
+    return output.cpu().squeeze(0)
 
 def save_generated_audio(output, sr):
    output_filename = 'generated_continuation'
@@ -192,8 +200,18 @@ def generate_audio():
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
         return jsonify({"error": "Invalid timestamp"}), 400
 
-    # Enqueue the task
-    job = q.enqueue(process_youtube_url, youtube_url, timestamp, model, promptLength, min_duration, max_duration, job_timeout=600)
+    # Enqueue the task with retry logic
+    job = q.enqueue(
+        process_youtube_url,
+        youtube_url,
+        timestamp,
+        model,
+        promptLength,
+        min_duration,
+        max_duration,
+        job_timeout=600,
+        retry=Retry(max=3)
+    )
     
     # Save task info in MongoDB
     audio_task = {
@@ -205,6 +223,25 @@ def generate_audio():
     task_id = audio_tasks.insert_one(audio_task).inserted_id
 
     return jsonify({"task_id": str(task_id)})
+
+@app.route('/continue', methods=['POST'])
+def continue_audio():
+    data = request.json
+    task_id = data['task_id']
+    musicgen_model = data['model']
+    prompt_duration = int(data.get('prompt_duration', 6))
+
+    task = audio_tasks.find_one({'_id': ObjectId(task_id)})
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+
+    input_data_base64 = task['audio']
+    output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
+    task['audio'] = output_data_base64
+    task['status'] = 'completed'
+    audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+
+    return jsonify({"task_id": task_id, "audio": output_data_base64})
 
 @app.route('/tasks/<jobId>', methods=['GET'])
 def get_task(jobId):

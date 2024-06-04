@@ -1,0 +1,12 @@
+flask
+flask-socketio
+gevent
+pymongo
+redis
+pydantic
+torchaudio
+torch==2.1.0
+audiocraft
+numpy
+gunicorn
+gevent-websocket

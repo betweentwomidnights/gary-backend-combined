@@ -24,7 +24,6 @@ import re
 
 from g4laudio import continue_music
 
-
 # MongoDB connection with retry logic
 def get_mongo_client():
     try:
@@ -41,7 +40,6 @@ if client:
     audio_tasks = db.audio_tasks
 else:
     print("Failed to connect to MongoDB.")
-
 
 # Redis connection
 redis_url = os.getenv('REDIS_URL', 'redis://redis:6379/0')
@@ -62,26 +60,51 @@ def is_valid_youtube_url(url):
     return re.match(youtube_pattern, url) is not None
 
 def cleanup_files(*file_paths):
-   for file_path in file_paths:
-       if os.path.exists(file_path):
-           os.remove(file_path)
+    for file_path in file_paths:
+        if os.path.exists(file_path) and file_path.endswith('.webm'):
+            os.remove(file_path)
 
 def download_audio(youtube_url):
-   downloaded_mp3 = 'downloaded_audio.mp3'
-   downloaded_webm = 'downloaded_audio.webm'
-   cleanup_files(downloaded_mp3, downloaded_webm)
-   ydl_opts = {
-       'format': 'bestaudio/best',
-       'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-       'outtmpl': 'downloaded_audio.%(ext)s',
-       'keepvideo': True,
-   }
-   with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-       ydl.download([youtube_url])
-   return downloaded_mp3, downloaded_webm
+    cache_dir = '/dataset/gary'
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+    
+    # Check Redis cache
+    audio_id = base64.urlsafe_b64encode(youtube_url.encode()).decode('utf-8')
+    cached_mp3_path = redis_conn.get(audio_id)
+    
+    if cached_mp3_path:
+        cached_mp3_path = cached_mp3_path.decode('utf-8')
+        if os.path.exists(cached_mp3_path):
+            print(f"Using cached audio for URL: {youtube_url}")
+            return cached_mp3_path
 
-def get_bpm(downloaded_mp3):
-    audio, sr = librosa.load(downloaded_mp3, sr=None)
+    downloaded_mp3 = 'downloaded_audio.mp3'
+    downloaded_webm = 'downloaded_audio.webm'
+    cleanup_files(downloaded_webm)
+    
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+        'outtmpl': 'downloaded_audio.%(ext)s',
+        'keepvideo': True,
+    }
+    
+    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([youtube_url])
+    
+    # Move the downloaded file to the cache directory
+    cached_mp3_path = os.path.join(cache_dir, f'{audio_id}.mp3')
+    os.rename(downloaded_mp3, cached_mp3_path)
+    cleanup_files(downloaded_webm)
+    
+    # Store the cached file path in Redis
+    redis_conn.set(audio_id, cached_mp3_path)
+    
+    return cached_mp3_path
+
+def get_bpm(cached_mp3_path):
+    audio, sr = librosa.load(cached_mp3_path, sr=None)
     onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
     tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
     if 120 < tempo < 200:
@@ -148,12 +171,11 @@ def save_generated_audio(output, sr):
    audio_write(output_filename, output, sr, strategy="loudness", loudness_compressor=True)
    return output_filename + '.wav'
 
-
 def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duration, max_duration):
     try:
-        downloaded_mp3, downloaded_webm = download_audio(youtube_url)
-        bpm = get_bpm(downloaded_mp3)
-        prompt_waveform, sr = load_and_preprocess_audio(downloaded_mp3, timestamp, promptLength)
+        cached_mp3_path = download_audio(youtube_url)
+        bpm = get_bpm(cached_mp3_path)
+        prompt_waveform, sr = load_and_preprocess_audio(cached_mp3_path, timestamp, promptLength)
         output = generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration)
         output_filename = save_generated_audio(output, sr)
 
@@ -167,7 +189,6 @@ def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duratio
             {'$set': {'output_filename': output_filename, 'status': 'completed', 'audio': encoded_audio}}
         )
 
-        cleanup_files(downloaded_mp3, downloaded_webm)
         return output_filename
     except Exception as e:
         print(f"Error processing YouTube URL: {e}")
@@ -190,7 +211,6 @@ def generate_audio():
     # Ensure that duration is correctly parsed and handled
     min_duration = int(duration[0])
     max_duration = int(duration[1])
-
 
     # Validate YouTube URL
     if not is_valid_youtube_url(youtube_url):

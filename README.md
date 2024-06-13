@@ -1,129 +1,53 @@
-this is the backend for gary on the fly
-![gotf-waveforms](https://github.com/betweentwomidnights/gotf-backend/assets/129577321/cf6cbb81-6c05-4c1c-9280-2bcdef792128)
+# Gary Backend
 
-an extension for remixing any youtube.com/watch page with musicgen continuations. 
+This repository serves as the backend for two applications: **gary-on-the-fly** and **gary4live**.
 
-using flask, mongoDB, rq worker + redis 
+the combined backend can be run using `docker-compose up` from the terminal.
 
-an express js server for the cropping of waveforms in the newtab component, and for exporting the arrangement to mp3.
+### gary4live
 
-the main script is concurrent_gary.py
+![gary4live](./gary4live%20screenshot.png)
 
-a standalone colab notebook for doing these continuations with any input audio is here:
+**gary4live** is a max for live device that enables musicgen continuations inside Ableton. there's no text prompting here. instead, think of each fine-tune as a "preset" in the VST.
 
-https://colab.research.google.com/drive/10CMvuI6DV_VPS0uktbrOB8jBQ7IhgDgL?usp=sharing
+#### Backend for gary4live
 
-the front-end for this extension can be found here:
+we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets-solo-backup.yml` file.
 
-https://github.com/betweentwomidnights/gotf-frontend
+just rename this file to `docker-compose.yml` in order to run it. you can rename the existing `docker-compose.yml` to something else for now.
 
+install docker and docker-compose in your environment.
 
+The front-end repository for **gary4live** can be found [here](https://github.com/betweentwomidnights/gary4live). 
 
+There is an installer for mac and pc. or you can build the electron UI yourself using that repository.
 
+you'll need ableton live. you can use gary with the 30 day trial of ableton if you want.
 
+## installation
 
+1. **install docker and docker compose**
+   - Follow the instructions on the [Docker website](https://docs.docker.com/get-docker/) to install Docker.
+   - Follow the instructions on the [Docker Compose website](https://docs.docker.com/compose/install/) to install Docker Compose.
 
+2. **clone this repository**
+   ```sh
+   git clone https://github.com/betweentwomidnights/gary-backend-combined.git
+   cd gary-backend-combined
+   mv docker-compose.yml docker-compose-combined.yml
+   mv docker-compose-g4lwebsockets-solo-backup.yml docker-compose.yml
+   sudo docker-compose up
 
+if you want to be mega-chad, you can simply run the existing `docker-compose.yml` to have both backends run simultaneously. on a 3050, generations can actually be triggered at the same time, but your computer will get real hot real quick.
 
+### gary-on-the-fly
 
+![gary-on-the-fly](./gotf%20screenshot.png)
 
+this backend (`Dockerfile.concurrent_gary`) is for the browser extension known as gary-on-the-fly. it uses yt-dlp in combination with the timestamp of the user's current youtube.com/watch url to do a musicgen continuation. then, the generations can be extended/cropped and arranged in the newtab component.
 
+the front-end for gary-on-the-fly is at (https://github.com/betweentwomidnights/gotf-frontend.git)
 
+a third backend can easily be spun up using `Dockerfile.concurrent_gary`, `requirements-concurrent_gary.txt`, `requirements-concurrent_gary.txt`, and the two docker images for mongoDB and redis that we already have in the main `docker-compose.yml` of this repo.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-# AudioCraft
-![docs badge](https://github.com/facebookresearch/audiocraft/workflows/audiocraft_docs/badge.svg)
-![linter badge](https://github.com/facebookresearch/audiocraft/workflows/audiocraft_linter/badge.svg)
-![tests badge](https://github.com/facebookresearch/audiocraft/workflows/audiocraft_tests/badge.svg)
-
-AudioCraft is a PyTorch library for deep learning research on audio generation. AudioCraft contains inference and training code
-for two state-of-the-art AI generative models producing high-quality audio: AudioGen and MusicGen.
-
-
-## Installation
-AudioCraft requires Python 3.9, PyTorch 2.0.0. To install AudioCraft, you can run the following:
-
-```shell
-# Best to make sure you have torch installed first, in particular before installing xformers.
-# Don't run this if you already have PyTorch installed.
-python -m pip install 'torch>=2.0'
-# Then proceed to one of the following
-python -m pip install -U audiocraft  # stable release
-python -m pip install -U git+https://git@github.com/facebookresearch/audiocraft#egg=audiocraft  # bleeding edge
-python -m pip install -e .  # or if you cloned the repo locally (mandatory if you want to train).
-```
-
-We also recommend having `ffmpeg` installed, either through your system or Anaconda:
-```bash
-sudo apt-get install ffmpeg
-# Or if you are using Anaconda or Miniconda
-conda install "ffmpeg<5" -c conda-forge
-```
-
-## Models
-
-At the moment, AudioCraft contains the training code and inference code for:
-* [MusicGen](./docs/MUSICGEN.md): A state-of-the-art controllable text-to-music model.
-* [AudioGen](./docs/AUDIOGEN.md): A state-of-the-art text-to-sound model.
-* [EnCodec](./docs/ENCODEC.md): A state-of-the-art high fidelity neural audio codec.
-* [Multi Band Diffusion](./docs/MBD.md): An EnCodec compatible decoder using diffusion.
-
-## Training code
-
-AudioCraft contains PyTorch components for deep learning research in audio and training pipelines for the developed models.
-For a general introduction of AudioCraft design principles and instructions to develop your own training pipeline, refer to
-the [AudioCraft training documentation](./docs/TRAINING.md).
-
-For reproducing existing work and using the developed training pipelines, refer to the instructions for each specific model
-that provides pointers to configuration, example grids and model/task-specific information and FAQ.
-
-
-## API documentation
-
-We provide some [API documentation](https://facebookresearch.github.io/audiocraft/api_docs/audiocraft/index.html) for AudioCraft.
-
-
-## FAQ
-
-#### Is the training code available?
-
-Yes! We provide the training code for [EnCodec](./docs/ENCODEC.md), [MusicGen](./docs/MUSICGEN.md) and [Multi Band Diffusion](./docs/MBD.md).
-
-#### Where are the models stored?
-
-Hugging Face stored the model in a specific location, which can be overriden by setting the `AUDIOCRAFT_CACHE_DIR` environment variable for the AudioCraft models.
-In order to change the cache location of the other Hugging Face models, please check out the [Hugging Face Transformers documentation for the cache setup](https://huggingface.co/docs/transformers/installation#cache-setup).
-Finally, if you use a model that relies on Demucs (e.g. `musicgen-melody`) and want to change the download location for Demucs, refer to the [Torch Hub documentation](https://pytorch.org/docs/stable/hub.html#where-are-my-downloaded-models-saved).
-
-
-## License
-* The code in this repository is released under the MIT license as found in the [LICENSE file](LICENSE).
-* The models weights in this repository are released under the CC-BY-NC 4.0 license as found in the [LICENSE_weights file](LICENSE_weights).
-
-
-## Citation
-
-For the general framework of AudioCraft, please cite the following.
-```
-@inproceedings{copet2023simple,
-    title={Simple and Controllable Music Generation},
-    author={Jade Copet and Felix Kreuk and Itai Gat and Tal Remez and David Kant and Gabriel Synnaeve and Yossi Adi and Alexandre Défossez},
-    booktitle={Thirty-seventh Conference on Neural Information Processing Systems},
-    year={2023},
-}
-```
-
-When referring to a specific model, please cite as mentioned in the model specific README, e.g
-[./docs/MUSICGEN.md](./docs/MUSICGEN.md), [./docs/AUDIOGEN.md](./docs/AUDIOGEN.md), etc.
+any fine-tunes hosted on huggingface can be used in both backends. 

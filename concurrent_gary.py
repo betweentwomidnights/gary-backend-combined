@@ -250,12 +250,12 @@ def continue_audio():
     task_id = data['task_id']
     musicgen_model = data['model']
     prompt_duration = int(data.get('prompt_duration', 6))
+    input_data_base64 = data['audio']  # Get the audio data from the request
 
     task = audio_tasks.find_one({'_id': ObjectId(task_id)})
     if not task:
         return jsonify({"error": "Task not found"}), 404
 
-    input_data_base64 = task['audio']
     output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
     task['audio'] = output_data_base64
     task['status'] = 'completed'

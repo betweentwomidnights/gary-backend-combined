@@ -8,9 +8,9 @@ the combined backend can be run using `docker-compose up` from the terminal.
 
 ![gary4live](./gary4live%20screenshot.png)
 
-**gary4live** is a max for live device that enables musicgen continuations inside Ableton. there's no text prompting here. instead, think of each fine-tune as a "preset" in the VST.
+**gary4live** is a max for live device that enables musicgen continuations inside ableton. there's no text prompting here. instead, think of each fine-tune as a "preset" in the VST.
 
-#### Backend for gary4live
+#### backend for gary4live
 
 we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets-solo-backup.yml` file.
 

@@ -1,4 +1,4 @@
-# Gary Backend
+# gary
 
 This repository serves as the backend for two applications: **gary-on-the-fly** and **gary4live**.
 

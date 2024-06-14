@@ -30,13 +30,15 @@ you'll need ableton live. you can use gary with the 30 day trial of ableton if y
    - Follow the instructions on the [Docker website](https://docs.docker.com/get-docker/) to install Docker.
    - Follow the instructions on the [Docker Compose website](https://docs.docker.com/compose/install/) to install Docker Compose.
 
-2. **clone this repository**
+2. **Clone this repository**
+
    ```sh
    git clone https://github.com/betweentwomidnights/gary-backend-combined.git
    cd gary-backend-combined
    mv docker-compose.yml docker-compose-combined.yml
    mv docker-compose-g4lwebsockets-solo-backup.yml docker-compose.yml
    sudo docker-compose up
+
 
 if you want to be mega-chad, you can simply run the existing `docker-compose.yml` to have both backends run simultaneously. on a 3050, generations can actually be triggered at the same time, but your computer will get real hot real quick.
 

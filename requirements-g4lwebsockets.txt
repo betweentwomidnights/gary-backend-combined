@@ -7,6 +7,6 @@ pydantic
 torchaudio
 torch==2.1.0
 audiocraft
-numpy
+numpy==1.24
 gunicorn
 gevent-websocket

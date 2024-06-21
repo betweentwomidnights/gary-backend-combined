@@ -23,6 +23,7 @@ import bson  # Import bson to handle bson-related errors
 import re
 
 from g4laudio import continue_music
+import gc
 
 # MongoDB connection with retry logic
 def get_mongo_client():
@@ -68,11 +69,11 @@ def download_audio(youtube_url):
     cache_dir = '/dataset/gary'
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
-    
+
     # Check Redis cache
     audio_id = base64.urlsafe_b64encode(youtube_url.encode()).decode('utf-8')
     cached_mp3_path = redis_conn.get(audio_id)
-    
+
     if cached_mp3_path:
         cached_mp3_path = cached_mp3_path.decode('utf-8')
         if os.path.exists(cached_mp3_path):
@@ -82,25 +83,25 @@ def download_audio(youtube_url):
     downloaded_mp3 = 'downloaded_audio.mp3'
     downloaded_webm = 'downloaded_audio.webm'
     cleanup_files(downloaded_webm)
-    
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
         'outtmpl': 'downloaded_audio.%(ext)s',
         'keepvideo': True,
     }
-    
+
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
-    
+
     # Move the downloaded file to the cache directory
     cached_mp3_path = os.path.join(cache_dir, f'{audio_id}.mp3')
     os.rename(downloaded_mp3, cached_mp3_path)
     cleanup_files(downloaded_webm)
-    
+
     # Store the cached file path in Redis
     redis_conn.set(audio_id, cached_mp3_path)
-    
+
     return cached_mp3_path
 
 def get_bpm(cached_mp3_path):
@@ -114,16 +115,16 @@ def get_bpm(cached_mp3_path):
 def calculate_duration(bpm, min_duration, max_duration):
     single_bar_duration = 4 * 60 / bpm
     bars = max(min_duration // single_bar_duration, 1)
-    
+
     while single_bar_duration * bars < min_duration:
         bars += 1
-    
+
     duration = single_bar_duration * bars
-    
+
     while duration > max_duration and bars > 1:
         bars -= 1
         duration = single_bar_duration * bars
-    
+
     return duration
 
 def load_and_preprocess_audio(file_path, timestamp, promptLength):
@@ -232,7 +233,7 @@ def generate_audio():
         job_timeout=600,
         retry=Retry(max=3)
     )
-    
+
     # Save task info in MongoDB
     audio_task = {
         'rq_job_id': job.get_id(),
@@ -246,22 +247,38 @@ def generate_audio():
 
 @app.route('/continue', methods=['POST'])
 def continue_audio():
-    data = request.json
-    task_id = data['task_id']
-    musicgen_model = data['model']
-    prompt_duration = int(data.get('prompt_duration', 6))
-    input_data_base64 = data['audio']  # Get the audio data from the request
+    try:
+        data = request.json
+        task_id = data['task_id']
+        musicgen_model = data['model']
+        prompt_duration = int(data.get('prompt_duration', 6))
+        input_data_base64 = data['audio']  # Get the audio data from the request
 
-    task = audio_tasks.find_one({'_id': ObjectId(task_id)})
-    if not task:
-        return jsonify({"error": "Task not found"}), 404
+        print(f"Memory before DB find: {torch.cuda.memory_allocated()} bytes")
+        task = audio_tasks.find_one({'_id': ObjectId(task_id)})
+        print(f"Memory after DB find: {torch.cuda.memory_allocated()} bytes")
+        if not task:
+            return jsonify({"error": "Task not found"}), 404
 
-    output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
-    task['audio'] = output_data_base64
-    task['status'] = 'completed'
-    audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+        output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
+        task['audio'] = output_data_base64
+        task['status'] = 'completed'
 
-    return jsonify({"task_id": task_id, "audio": output_data_base64})
+        print(f"Memory before DB update: {torch.cuda.memory_allocated()} bytes")
+        audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+        print(f"Memory after DB update: {torch.cuda.memory_allocated()} bytes")
+
+        return jsonify({"task_id": task_id, "audio": output_data_base64})
+    finally:
+        # Cleanup
+        del data, task_id, musicgen_model, prompt_duration, input_data_base64, task
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+        gc.collect()
+        torch.cuda.synchronize()  # Ensure all streams and memory operations are complete
+
+
 
 @app.route('/tasks/<jobId>', methods=['GET'])
 def get_task(jobId):

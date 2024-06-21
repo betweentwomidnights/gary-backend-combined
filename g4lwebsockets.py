@@ -8,6 +8,8 @@ import redis
 from g4laudio import process_audio, continue_music, generate_session_id
 from bson.objectid import ObjectId
 from pydantic import BaseModel, ValidationError
+import torch
+
 
 # MongoDB setup
 # THIS IS THE LOCAL VERSION
@@ -20,13 +22,36 @@ fs = GridFS(db)
 # Redis setup
 
 # THIS IS THE LOCAL VERSION
-# redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
 redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
+# redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 
 app = Flask(__name__)
 # THIS IS THE LOCAL VERSION
 # socketio = SocketIO(app, message_queue='redis://localhost:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
 socketio = SocketIO(app, message_queue='redis://redis:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
+
+# Middleware to check GPU memory before each request
+@app.before_request
+def check_gpu_memory():
+    path = request.path
+    model_memory_requirements = {
+        'thepatch/budots_remix': 3000,
+        'thepatch/vanya_ai_dnb_0.1': 3000,
+        'thepatch/PhonkV2': 3000,
+        'facebook/musicgen-small': 3000,
+        'thepatch/bleeps-medium': 6000,
+        'facebook/musicgen-medium': 6000,
+        'facebook/musicgen-large': 9000,
+        'thepatch/hoenn_lofi': 9000,
+    }
+
+    if request.method == 'POST' and request.is_json:
+        data = request.get_json()
+        model_name = data.get('model_name')
+        if model_name and model_name in model_memory_requirements:
+            required_memory = model_memory_requirements[model_name]
+            if not is_gpu_memory_available(required_memory):
+                return jsonify({"error": "Insufficient GPU memory available for processing."}), 503
 
 @app.route('/')
 def index():
@@ -157,7 +182,7 @@ def handle_continue_music(data):
                 def progress_callback(current, total):
                     progress_percent = (current / total) * 100
                     emit('progress_update', {'progress': int(progress_percent), 'session_id': session_id}, room=session_id)
-                
+
                 result_base64 = continue_music(last_processed_base64, model_name, progress_callback, prompt_duration=prompt_duration)
                 store_audio_data(session_id, last_processed_base64, 'last_input_audio')  # Store last input used for continuation
                 store_audio_data(session_id, result_base64, 'last_processed_audio')  # Update last processed with new continuation

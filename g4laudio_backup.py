@@ -137,4 +137,6 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
     output_audio.seek(0)
     output_data_base64 = base64.b64encode(output_audio.read()).decode('utf-8')
 
+    del song, prompt_waveform, output, combined_waveform, model_continue
+
     return output_data_base64

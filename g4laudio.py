@@ -7,6 +7,7 @@ import base64
 import io
 import uuid
 import torchaudio.transforms as T
+import gc
 
 def generate_session_id():
     """Generate a unique session ID."""
@@ -35,11 +36,11 @@ def wrap_audio_if_needed(waveform, sr, desired_duration):
     return waveform
 
 def process_audio(input_data_base64, model_name, progress_callback=None, prompt_duration=6):
-    try:
-        # Decode the base64 input data
-        input_data = base64.b64decode(input_data_base64)
-        input_audio = io.BytesIO(input_data)
+    # Decode the base64 input data
+    input_data = base64.b64decode(input_data_base64)
+    input_audio = io.BytesIO(input_data)
 
+    try:
         # Load the input audio
         song, sr = torchaudio.load(input_audio)
         song = song.cuda()  # Move the tensor to GPU for processing
@@ -52,6 +53,8 @@ def process_audio(input_data_base64, model_name, progress_callback=None, prompt_
             # Resample the audio to match the model's expected sample rate
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=expected_sr).cuda()
             song_resampled = resampler(song)
+            del resampler  # Ensure resampler is deleted
+            torch.cuda.empty_cache()
         else:
             song_resampled = song
 
@@ -86,22 +89,21 @@ def process_audio(input_data_base64, model_name, progress_callback=None, prompt_
         output_audio.seek(0)
         output_data_base64 = base64.b64encode(output_audio.read()).decode('utf-8')
 
-        # Clear GPU memory
-        del song, song_resampled, processed_waveform, prompt_waveform, output
+    finally:
+        # Cleanup to ensure all resources are freed
+        input_audio.close()
+        del model_continue, song, song_resampled, processed_waveform, prompt_waveform, output, input_data, output_audio
         torch.cuda.empty_cache()
+        gc.collect()
 
-        return output_data_base64
-    except Exception as e:
-        print(f"Error processing audio: {e}")
-        torch.cuda.empty_cache()
-        raise
+    return output_data_base64
 
 def continue_music(input_data_base64, musicgen_model, progress_callback=None, prompt_duration=6):
-    try:
-        # Decode the base64 input data
-        input_data = base64.b64decode(input_data_base64)
-        input_audio = io.BytesIO(input_data)
+    # Decode the base64 input data
+    input_data = base64.b64decode(input_data_base64)
+    input_audio = io.BytesIO(input_data)
 
+    try:
         song, sr = torchaudio.load(input_audio)
         song = song.to('cuda')  # Assume CUDA is available and preferred
 
@@ -129,6 +131,8 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
         if sr != 32000:
             resampler = T.Resample(orig_freq=32000, new_freq=sr).to('cuda')
             output = resampler(output)
+            del resampler  # Ensure resampler is deleted
+            torch.cuda.empty_cache()
 
         # Ensure all tensors are on the same device and have the same number of channels
         original_minus_prompt = song[:, :-int(prompt_duration * sr)]
@@ -145,12 +149,11 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
         output_audio.seek(0)
         output_data_base64 = base64.b64encode(output_audio.read()).decode('utf-8')
 
-        # Clear GPU memory
-        del song, prompt_waveform, output, combined_waveform
+    finally:
+        # Cleanup to ensure all resources are freed
+        input_audio.close()
+        del song, prompt_waveform, output, combined_waveform, model_continue, output_audio, input_data
         torch.cuda.empty_cache()
+        gc.collect()
 
-        return output_data_base64
-    except Exception as e:
-        print(f"Error continuing music: {e}")
-        torch.cuda.empty_cache()
-        raise
+    return output_data_base64

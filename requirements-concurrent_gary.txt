@@ -5,6 +5,7 @@ audiocraft
 flask
 flask-cors
 gunicorn
+numpy==1.24
 
 # Additional dependencies
 yt-dlp

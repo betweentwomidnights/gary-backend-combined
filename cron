@@ -1,0 +1,2 @@
+0 0 * * * docker restart $(docker ps -q --filter "name=concurrent_gary")
+0 12 * * * docker restart $(docker ps -q --filter "name=concurrent_gary")

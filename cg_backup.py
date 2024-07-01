@@ -23,6 +23,7 @@ import bson  # Import bson to handle bson-related errors
 import re
 
 from g4laudio import continue_music
+import gc
 
 # MongoDB connection with retry logic
 def get_mongo_client():
@@ -246,22 +247,38 @@ def generate_audio():
 
 @app.route('/continue', methods=['POST'])
 def continue_audio():
-    data = request.json
-    task_id = data['task_id']
-    musicgen_model = data['model']
-    prompt_duration = int(data.get('prompt_duration', 6))
+    try:
+        data = request.json
+        task_id = data['task_id']
+        musicgen_model = data['model']
+        prompt_duration = int(data.get('prompt_duration', 6))
+        input_data_base64 = data['audio']  # Get the audio data from the request
 
-    task = audio_tasks.find_one({'_id': ObjectId(task_id)})
-    if not task:
-        return jsonify({"error": "Task not found"}), 404
+        print(f"Memory before DB find: {torch.cuda.memory_allocated()} bytes")
+        task = audio_tasks.find_one({'_id': ObjectId(task_id)})
+        print(f"Memory after DB find: {torch.cuda.memory_allocated()} bytes")
+        if not task:
+            return jsonify({"error": "Task not found"}), 404
 
-    input_data_base64 = task['audio']
-    output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
-    task['audio'] = output_data_base64
-    task['status'] = 'completed'
-    audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+        output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
+        task['audio'] = output_data_base64
+        task['status'] = 'completed'
 
-    return jsonify({"task_id": task_id, "audio": output_data_base64})
+        print(f"Memory before DB update: {torch.cuda.memory_allocated()} bytes")
+        audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+        print(f"Memory after DB update: {torch.cuda.memory_allocated()} bytes")
+
+        return jsonify({"task_id": task_id, "audio": output_data_base64})
+    finally:
+        # Cleanup
+        del data, task_id, musicgen_model, prompt_duration, input_data_base64, task
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+        gc.collect()
+        torch.cuda.synchronize()  # Ensure all streams and memory operations are complete
+
+
 
 @app.route('/tasks/<jobId>', methods=['GET'])
 def get_task(jobId):
@@ -273,6 +290,22 @@ def get_task(jobId):
             return jsonify({"error": "Task not found"}), 404
     except bson.errors.InvalidId:
         return jsonify({"error": "Invalid ObjectId format"}), 400
+
+@app.route('/fetch-result/<taskId>', methods=['GET'])
+def fetch_result(taskId):
+    try:
+        task = audio_tasks.find_one({'_id': ObjectId(taskId)})
+        if task:
+            if task.get('status') == 'completed':
+                return jsonify({"status": "completed", "audio": task.get('audio')})
+            else:
+                return jsonify({"status": task.get('status')})
+        else:
+            return jsonify({"error": "Task not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
 
 if __name__ == '__main__':
     app.run(debug=True, threaded=True)

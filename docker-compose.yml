@@ -1,33 +1,10 @@
 version: '3.8'
 services:
-  g4lwebsockets:
-    image: thecollabagepatch/g4lwebsockets:latest  # Use the local image
-    build:
-      context: .
-      dockerfile: Dockerfile.g4lwebsockets
-    ports:
-      - "8000:8000"
-    environment:
-      - ENV_VARIABLE=value  # Add any required environment variables here
-    depends_on:
-      - redis
-      - mongo
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
   concurrent_gary:
-    image: thecollabagepatch/concurrent_gary:latest  # Use the local image
-    build:
-      context: .
-      dockerfile: Dockerfile.concurrent_gary
-    ports:
-      - "8001:8001"
+    image: thecollabagepatch/concurrent_gary:latest
     environment:
-      - ENV_VARIABLE=value  # Add any required environment variables here
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=1
     depends_on:
       - redis
       - mongo
@@ -39,28 +16,48 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-  
+    ports:
+      - "8001:8001" # Ensure this line is added to expose port 8001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/generate || curl -f http://localhost:8001/continue || curl -f http://localhost:8001/tasks"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
   express-server:
-    image: thecollabagepatch/express-server:latest  # Use the local image
-    build:
-      context: .
-      dockerfile: Dockerfile.express-server
+    image: thecollabagepatch/express-server:latest
     ports:
       - "3000:3000"
     environment:
-      - ENV_VARIABLE=value  # Add any required environment variables here
-  
+      - ENV_VARIABLE=value
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/combine-audio"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
   redis:
-    image: "redis:alpine"
+    image: thecollabagepatch/redis:latest
     ports:
       - "6379:6379"
 
   mongo:
-    image: "mongo:latest"
+    image: mongo:latest
     ports:
       - "27017:27017"
     volumes:
       - mongo-data:/data/db
+
+  cron:
+    image: docker:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./cron:/etc/crontabs/root
+    entrypoint: /bin/sh -c "crond -f"
 
 volumes:
   mongo-data:

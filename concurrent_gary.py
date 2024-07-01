@@ -24,6 +24,7 @@ import re
 
 from g4laudio import continue_music
 import gc
+import time
 
 # MongoDB connection with retry logic
 def get_mongo_client():
@@ -155,7 +156,7 @@ def load_and_preprocess_audio(file_path, timestamp, promptLength):
 
   return prompt_waveform, sr
 
-def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration):
+def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration, progress_callback=None):
     # Calculate the duration to end at a bar
     duration = calculate_duration(bpm, min_duration, max_duration)
 
@@ -163,6 +164,7 @@ def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, m
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         model_continue = MusicGen.get_pretrained(model)
+        model_continue.set_custom_progress_callback(progress_callback)
         model_continue.set_generation_params(use_sampling=True, top_k=250, top_p=0.0, temperature=1.0, duration=duration, cfg_coef=3)
         output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
     return output.cpu().squeeze(0)
@@ -172,12 +174,17 @@ def save_generated_audio(output, sr):
    audio_write(output_filename, output, sr, strategy="loudness", loudness_compressor=True)
    return output_filename + '.wav'
 
-def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duration, max_duration):
+def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duration, max_duration, task_id):
     try:
+        def progress_callback(current_step, total_steps):
+            progress_percent = (current_step / total_steps) * 100
+            print(f"Progress: {progress_percent}% for task {task_id}")
+            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)  # Set progress with a TTL of 600 seconds
+
         cached_mp3_path = download_audio(youtube_url)
         bpm = get_bpm(cached_mp3_path)
         prompt_waveform, sr = load_and_preprocess_audio(cached_mp3_path, timestamp, promptLength)
-        output = generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration)
+        output = generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration, progress_callback)
         output_filename = save_generated_audio(output, sr)
 
         # Encode the audio data
@@ -186,7 +193,7 @@ def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duratio
 
         # Save task info, audio reference, and status in MongoDB
         audio_tasks.update_one(
-            {'youtube_url': youtube_url, 'timestamp': timestamp},
+            {'_id': ObjectId(task_id)},
             {'$set': {'output_filename': output_filename, 'status': 'completed', 'audio': encoded_audio}}
         )
 
@@ -195,7 +202,39 @@ def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duratio
         print(f"Error processing YouTube URL: {e}")
         # Update the task status in MongoDB in case of an error
         audio_tasks.update_one(
-            {'youtube_url': youtube_url, 'timestamp': timestamp},
+            {'_id': ObjectId(task_id)},
+            {'$set': {'status': 'failed'}}
+        )
+        return None
+
+def process_continuation(task_id, input_data_base64, musicgen_model, prompt_duration):
+    try:
+        def progress_callback(current_step, total_steps):
+            progress_percent = (current_step / total_steps) * 100
+            print(f"Progress: {progress_percent}% for task {task_id}")
+            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)  # Set progress with a TTL of 600 seconds
+
+        print(f"Memory before DB find: {torch.cuda.memory_allocated()} bytes")
+        task = audio_tasks.find_one({'_id': ObjectId(task_id)})
+        print(f"Memory after DB find: {torch.cuda.memory_allocated()} bytes")
+        if not task:
+            print("Task not found")
+            return None
+
+        output_data_base64 = continue_music(input_data_base64, musicgen_model, progress_callback=progress_callback, prompt_duration=prompt_duration)
+        task['audio'] = output_data_base64
+        task['status'] = 'completed'
+
+        print(f"Memory before DB update: {torch.cuda.memory_allocated()} bytes")
+        audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
+        print(f"Memory after DB update: {torch.cuda.memory_allocated()} bytes")
+
+        return output_data_base64
+    except Exception as e:
+        print(f"Error processing continuation: {e}")
+        # Update the task status in MongoDB in case of an error
+        audio_tasks.update_one(
+            {'_id': ObjectId(task_id)},
             {'$set': {'status': 'failed'}}
         )
         return None
@@ -221,6 +260,15 @@ def generate_audio():
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
         return jsonify({"error": "Invalid timestamp"}), 400
 
+    # Save task info in MongoDB
+    audio_task = {
+        'rq_job_id': None,
+        'youtube_url': youtube_url,
+        'timestamp': timestamp,
+        'status': 'pending'
+    }
+    task_id = audio_tasks.insert_one(audio_task).inserted_id
+
     # Enqueue the task with retry logic
     job = q.enqueue(
         process_youtube_url,
@@ -230,53 +278,48 @@ def generate_audio():
         promptLength,
         min_duration,
         max_duration,
+        str(task_id),
         job_timeout=600,
         retry=Retry(max=3)
     )
 
-    # Save task info in MongoDB
-    audio_task = {
-        'rq_job_id': job.get_id(),
-        'youtube_url': youtube_url,
-        'timestamp': timestamp,
-        'status': 'pending'
-    }
-    task_id = audio_tasks.insert_one(audio_task).inserted_id
+    # Update the job ID in the MongoDB task record
+    audio_tasks.update_one({'_id': ObjectId(task_id)}, {'$set': {'rq_job_id': job.get_id()}})
 
     return jsonify({"task_id": str(task_id)})
 
 @app.route('/continue', methods=['POST'])
 def continue_audio():
-    try:
-        data = request.json
-        task_id = data['task_id']
-        musicgen_model = data['model']
-        prompt_duration = int(data.get('prompt_duration', 6))
-        input_data_base64 = data['audio']  # Get the audio data from the request
+    data = request.json
+    task_id = data['task_id']
+    musicgen_model = data['model']
+    prompt_duration = int(data.get('prompt_duration', 6))
+    input_data_base64 = data['audio']  # Get the audio data from the request
 
-        print(f"Memory before DB find: {torch.cuda.memory_allocated()} bytes")
-        task = audio_tasks.find_one({'_id': ObjectId(task_id)})
-        print(f"Memory after DB find: {torch.cuda.memory_allocated()} bytes")
-        if not task:
-            return jsonify({"error": "Task not found"}), 404
+    # Validate task ID
+    if not ObjectId.is_valid(task_id):
+        return jsonify({"error": "Invalid task ID"}), 400
 
-        output_data_base64 = continue_music(input_data_base64, musicgen_model, prompt_duration=prompt_duration)
-        task['audio'] = output_data_base64
-        task['status'] = 'completed'
+    # Save task info in MongoDB
+    audio_task = audio_tasks.find_one({'_id': ObjectId(task_id)})
+    if not audio_task:
+        return jsonify({"error": "Task not found"}), 404
 
-        print(f"Memory before DB update: {torch.cuda.memory_allocated()} bytes")
-        audio_tasks.update_one({'_id': ObjectId(task_id)}, {"$set": task})
-        print(f"Memory after DB update: {torch.cuda.memory_allocated()} bytes")
+    # Enqueue the task with retry logic
+    job = q.enqueue(
+        process_continuation,
+        str(task_id),
+        input_data_base64,
+        musicgen_model,
+        prompt_duration,
+        job_timeout=600,
+        retry=Retry(max=3)
+    )
 
-        return jsonify({"task_id": task_id, "audio": output_data_base64})
-    finally:
-        # Cleanup
-        del data, task_id, musicgen_model, prompt_duration, input_data_base64, task
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.reset_accumulated_memory_stats()
-        gc.collect()
-        torch.cuda.synchronize()  # Ensure all streams and memory operations are complete
+    # Update the job ID in the MongoDB task record
+    audio_tasks.update_one({'_id': ObjectId(task_id)}, {'$set': {'rq_job_id': job.get_id(), 'status': 'pending'}})
+
+    return jsonify({"task_id": str(task_id)})
 
 
 
@@ -290,6 +333,33 @@ def get_task(jobId):
             return jsonify({"error": "Task not found"}), 404
     except bson.errors.InvalidId:
         return jsonify({"error": "Invalid ObjectId format"}), 400
+
+@app.route('/fetch-result/<taskId>', methods=['GET'])
+def fetch_result(taskId):
+    try:
+        task = audio_tasks.find_one({'_id': ObjectId(taskId)})
+        if task:
+            if task.get('status') == 'completed':
+                return jsonify({"status": "completed", "audio": task.get('audio')})
+            else:
+                return jsonify({"status": task.get('status')})
+        else:
+            return jsonify({"error": "Task not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/progress/<taskId>', methods=['GET'])
+def get_progress(taskId):
+    try:
+        progress = redis_conn.get(f"progress_{taskId}")
+        if progress:
+            return jsonify({"progress": float(progress)})
+        else:
+            return jsonify({"progress": 0.0})  # Default to 0 if no progress found
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 if __name__ == '__main__':
     app.run(debug=True, threaded=True)

@@ -55,6 +55,19 @@ the front-end for gary-on-the-fly is at (https://github.com/betweentwomidnights/
 there's also a web app at https://thecollabagepatch.com (go to gary's page and click gary4web)
 i still need to push the web app front-end to github. gary4web uses the `concurrent_gary` setup.
 
+  ```sh
+mv docker-compose-concurrent_gary.yml docker-compose.yml
+sudo docker build -t thecollabagepatch/concurrent_gary:latest -f Dockerfile.concurrent_gary .
+sudo docker build -t thecollabagepatch/redis:latest -f Dockerfile.redis .
+cd express-server
+sudo docker build -t thecollabagepatch/express-server:latest -f Dockerfile .
+
+cd gary-backend-combined
+
+sudo docker-compose up
+```
+
+
 a third backend exists for a multi-gpu setup that uses both docker images. it's in the `old_random_backup_scripts` folder.
 
 any fine-tunes hosted on huggingface can be used in both backends. 

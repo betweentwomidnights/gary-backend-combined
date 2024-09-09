@@ -1,6 +1,10 @@
 # gary
 
-This repository serves as the backend for two applications: **gary-on-the-fly** and **gary4live**.
+This repository serves as the backend for two applications: **gary-on-the-fly** and **gary4live**. 
+
+there's now a gary_docs folder. you should go read that instead of this.
+
+
 
 the combined backend can be run using `docker-compose up` from the terminal.
 
@@ -12,7 +16,7 @@ the combined backend can be run using `docker-compose up` from the terminal.
 
 #### backend for gary4live
 
-we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets-solo-backup.yml` file.
+we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets.yml` file.
 
 just rename this file to `docker-compose.yml` in order to run it. you can rename the existing `docker-compose.yml` to something else for now.
 
@@ -35,12 +39,10 @@ you'll need ableton live. you can use gary with the 30 day trial of ableton if y
    ```sh
    git clone https://github.com/betweentwomidnights/gary-backend-combined.git
    cd gary-backend-combined
-   mv docker-compose.yml docker-compose-combined.yml
-   mv docker-compose-g4lwebsockets-solo-backup.yml docker-compose.yml
+   mv docker-compose-g4lwebsockets.yml docker-compose.yml
+   sudo docker build -t thecollabagepatch/g4lwebsockets:latest -f Dockerfile.g4lwebsockets .
+   sudo docker build -t thecollabagepatch/redis:latest -f Dockerfile.redis .
    sudo docker-compose up
-
-
-if you want to be mega-chad, you can simply run the existing `docker-compose.yml` to have both backends run simultaneously. on a 3050, generations can actually be triggered at the same time, but your computer will get real hot real quick.
 
 ### gary-on-the-fly
 
@@ -50,6 +52,9 @@ this backend (`Dockerfile.concurrent_gary`) is for the browser extension known a
 
 the front-end for gary-on-the-fly is at (https://github.com/betweentwomidnights/gotf-frontend.git)
 
-a third backend can easily be spun up using `Dockerfile.concurrent_gary`, `requirements-concurrent_gary.txt`, `requirements-concurrent_gary.txt`, and the two docker images for mongoDB and redis that we already have in the main `docker-compose.yml` of this repo.
+there's also a web app at https://thecollabagepatch.com (go to gary's page and click gary4web)
+i still need to push the web app front-end to github. gary4web uses the `concurrent_gary` setup.
+
+a third backend exists for a multi-gpu setup that uses both docker images. it's in the `old_random_backup_scripts` folder.
 
 any fine-tunes hosted on huggingface can be used in both backends. 

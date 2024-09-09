@@ -89,7 +89,7 @@ def download_audio(youtube_url):
         'format': 'bestaudio/best',
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
         'outtmpl': 'downloaded_audio.%(ext)s',
-        'keepvideo': True,
+        'keepvideo': False,
     }
 
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
@@ -129,32 +129,32 @@ def calculate_duration(bpm, min_duration, max_duration):
     return duration
 
 def load_and_preprocess_audio(file_path, timestamp, promptLength):
-  song, sr = torchaudio.load(file_path)
-  device = 'cuda' if torch.cuda.is_available() else 'cpu'
-  song = song.to(device)
-  expected_sr = 32000
-  if sr != expected_sr:
-      resampler = T.Resample(sr, expected_sr).to(device)
-      song = resampler(song)
-      sr = expected_sr
+    song, sr = torchaudio.load(file_path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    song = song.to(device)
+    expected_sr = 32000
+    if sr != expected_sr:
+        resampler = T.Resample(sr, expected_sr).to(device)
+        song = resampler(song)
+        sr = expected_sr
 
-  # Convert timestamp (seconds) to frames
-  frame_offset = int(timestamp * sr)
+    # Convert timestamp (seconds) to frames
+    frame_offset = int(timestamp * sr)
 
-  # Check if waveform duration after timestamp is less than 30 seconds
-  if song.shape[1] - frame_offset < 30 * sr:
-      # Wrap around to the beginning of the mp3
-      song = torch.cat((song[:, frame_offset:], song[:, :30 * sr - (song.shape[1] - frame_offset)]), dim=1)
-  else:
-      song = song[:, frame_offset:frame_offset + 30 * sr]
+    # Check if waveform duration after timestamp is less than 30 seconds
+    if song.shape[1] - frame_offset < 30 * sr:
+        # Wrap around to the beginning of the mp3
+        song = torch.cat((song[:, frame_offset:], song[:, :30 * sr - (song.shape[1] - frame_offset)]), dim=1)
+    else:
+        song = song[:, frame_offset:frame_offset + 30 * sr]
 
-  # Define the prompt length
-  prompt_length = promptLength * sr
+    # Define the prompt length
+    prompt_length = promptLength * sr
 
-  # Create the prompt waveform
-  prompt_waveform = song[:, :prompt_length] if song.shape[1] > prompt_length else song
+    # Create the prompt waveform
+    prompt_waveform = song[:, :prompt_length] if song.shape[1] > prompt_length else song
 
-  return prompt_waveform, sr
+    return prompt_waveform, sr
 
 def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration, progress_callback=None):
     # Calculate the duration to end at a bar
@@ -170,9 +170,9 @@ def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, m
     return output.cpu().squeeze(0)
 
 def save_generated_audio(output, sr):
-   output_filename = 'generated_continuation'
-   audio_write(output_filename, output, sr, strategy="loudness", loudness_compressor=True)
-   return output_filename + '.wav'
+    output_filename = 'generated_continuation'
+    audio_write(output_filename, output, sr, strategy="loudness", loudness_compressor=True)
+    return output_filename + '.wav'
 
 def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duration, max_duration, task_id):
     try:
@@ -321,8 +321,6 @@ def continue_audio():
 
     return jsonify({"task_id": str(task_id)})
 
-
-
 @app.route('/tasks/<jobId>', methods=['GET'])
 def get_task(jobId):
     try:
@@ -358,7 +356,46 @@ def get_progress(taskId):
             return jsonify({"progress": 0.0})  # Default to 0 if no progress found
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/health', methods=['GET'])
+def health_check():
+    health_status = {
+        "mongodb": "down",
+        "pytorch": "down",
+        "redis": "down",
+        "status": "down"
+    }
 
+    # Check MongoDB connection
+    try:
+        client.admin.command('ping')
+        health_status["mongodb"] = "live"
+    except Exception as e:
+        print(f"MongoDB health check failed: {e}")
+
+    # Check PyTorch
+    if torch.cuda.is_available():
+        print("PyTorch CUDA available")
+        health_status["pytorch"] = "live"
+    else:
+        print("PyTorch CUDA not available")
+
+    # Check Redis connection
+    try:
+        redis_conn.ping()
+        print("Redis connection successful")
+        health_status["redis"] = "live"
+    except Exception as e:
+        print(f"Redis health check failed: {e}")
+
+    # Set the overall status
+    if health_status["mongodb"] == "live" and health_status["pytorch"] == "live" and health_status["redis"] == "live":
+        health_status["status"] = "live"
+
+
+    print(f"Final health status: {health_status}")  # Debugging: print the health status
+
+    return jsonify(health_status), 200 if health_status["status"] == "live" else 503
 
 
 if __name__ == '__main__':

@@ -83,6 +83,8 @@ def process_audio(input_data_base64, model_name, progress_callback=None, prompt_
         # Generate the continuation
         output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=expected_sr, progress=True)
 
+        # Convert output tensor to a compatible format before saving
+        output = output.float()  # Ensure dtype is torch.float32
         # Convert the output tensor to a byte buffer
         output_audio = io.BytesIO()
         torchaudio.save(output_audio, format='wav', src=output.cpu().squeeze(0), sample_rate=expected_sr)
@@ -143,6 +145,10 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
         # Concatenate tensors
         combined_waveform = torch.cat([original_minus_prompt, output], dim=1).to('cuda')
 
+
+        # Convert output tensor to a compatible format before saving
+        output = output.float()  # Ensure dtype is torch.float32
+        
         # Save output
         output_audio = io.BytesIO()
         torchaudio.save(output_audio, format='wav', src=combined_waveform.cpu(), sample_rate=sr)

@@ -1,0 +1,63 @@
+version: '3.8'
+services:
+  concurrent_gary:
+    image: thecollabagepatch/concurrent_gary:latest
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    depends_on:
+      - redis
+      - mongo
+    entrypoint: ["/usr/src/app/concurrent_gary-entrypoint.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8001:8001" # Ensure this line is added to expose port 8001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
+  express-server:
+    image: thecollabagepatch/express-server:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - ENV_VARIABLE=value
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/combine-audio"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
+  redis:
+    image: thecollabagepatch/redis:latest
+    ports:
+      - "6379:6379"
+
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  cron:
+    image: docker:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./cron:/etc/crontabs/root
+    entrypoint: /bin/sh -c "crond -f"
+
+volumes:
+  mongo-data:

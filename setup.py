@@ -47,8 +47,9 @@ setup(
     install_requires=REQUIRED,
     extras_require={
         'dev': ['coverage', 'flake8', 'mypy', 'pdoc3', 'pytest'],
+        'wm': ['audioseal'],
     },
-    packages=find_packages(),
+    packages=[p for p in find_packages() if p.startswith('audiocraft')],
     package_data={'audiocraft': ['py.typed']},
     include_package_data=True,
     license='MIT License',

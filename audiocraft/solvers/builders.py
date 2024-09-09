@@ -45,13 +45,18 @@ def get_solver(cfg: omegaconf.DictConfig) -> StandardSolver:
     from .compression import CompressionSolver
     from .musicgen import MusicGenSolver
     from .diffusion import DiffusionSolver
+    from .magnet import MagnetSolver, AudioMagnetSolver
+    from .watermark import WatermarkSolver
     klass = {
         'compression': CompressionSolver,
         'musicgen': MusicGenSolver,
         'audiogen': AudioGenSolver,
+        'magnet': MagnetSolver,
+        'audio_magnet': AudioMagnetSolver,
         'lm': MusicGenSolver,  # backward compatibility
         'diffusion': DiffusionSolver,
         'sound_lm': AudioGenSolver,  # backward compatibility
+        'watermarking': WatermarkSolver,
     }[cfg.solver]
     return klass(cfg)  # type: ignore
 
@@ -108,7 +113,7 @@ def get_optimizer(params: tp.Union[nn.Module, tp.Iterable[torch.Tensor]], cfg: o
     elif cfg.optimizer == 'dadam':
         optimizer = optim.DAdaptAdam(parameters, lr=cfg.lr, **cfg.adam)
     else:
-        raise ValueError(f"Unsupported LR Scheduler: {cfg.lr_scheduler}")
+        raise ValueError(f"Unsupported Optimizer: {cfg.optimizer}")
     return optimizer
 
 
@@ -186,6 +191,9 @@ def get_loss(loss_name: str, cfg: omegaconf.DictConfig):
         'mrstft': losses.MRSTFTLoss,
         'msspec': losses.MultiScaleMelSpectrogramLoss,
         'sisnr': losses.SISNR,
+        'wm_detection': losses.WMDetectionLoss,
+        'wm_mb': losses.WMMbLoss,
+        'tf_loudnessratio': losses.TFLoudnessRatio
     }[loss_name]
     kwargs = dict(getattr(cfg, loss_name))
     return klass(**kwargs)

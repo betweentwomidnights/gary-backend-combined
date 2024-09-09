@@ -4,9 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [1.2.0a] - TBD
+## [1.4.0a1] - 2024-06-03
+
+Adding new metric PesqMetric ([Perceptual Evaluation of Speech Quality](https://doi.org/10.5281/zenodo.6549559))
+
+Adding multiple audio augmentation functions: generating pink noises, up-/downsampling, low-/highpass filtering, banpass filtering, smoothing, duck masking, boosting. All are wrapped in the `audiocraft.utils.audio_effects.AudioEffects` and can be called with the API `audiocraft.utils.audio_effects.select_audio_effects`.
+
+Add training code for AudioSeal (https://arxiv.org/abs/2401.17264) along with the [hf checkpoints]( https://huggingface.co/facebook/audioseal).
+
+## [1.3.0] - 2024-05-02
+
+Adding the MAGNeT model (https://arxiv.org/abs/2401.04577) along with hf checkpoints and a gradio demo app.
+
+Typo fixes.
+
+Fixing setup.py to install only audiocraft, not the unit tests and scripts.
+
+Fix FSDP support with PyTorch 2.1.0. 
+
+## [1.2.0] - 2024-01-11
 
 Adding stereo models.
+
+Fixed the commitment loss, which was until now only applied to the first RVQ layer.
+
+Removed compression model state from the LM checkpoints, for consistency, it
+should always be loaded from the original `compression_model_checkpoint`.
 
 
 ## [1.1.0] - 2023-11-06

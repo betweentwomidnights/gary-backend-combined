@@ -10,3 +10,4 @@ audiocraft
 numpy==1.24
 gunicorn
 gevent-websocket
+flask_cors

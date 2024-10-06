@@ -5,8 +5,6 @@ this repository serves as the backend for three applications: **gary-on-the-fly*
 
 there's now a gary_docs folder. it's a mega-WIP.
 
-the combined backend can be run using `docker-compose up` from the terminal.
-
 ### gary4live (g4lwebsockets)
 
 ![gary4live](./gary4live%20screenshot.png)

@@ -4,8 +4,9 @@ FROM redis:latest
 # Create the necessary directory
 RUN mkdir -p /usr/local/etc/redis
 
-# Set the packet size to 256MB
+# Set the output buffer limits for both normal and pubsub clients
 RUN echo "client-output-buffer-limit normal 0 256mb 300" >> /usr/local/etc/redis/redis.conf
+RUN echo "client-output-buffer-limit pubsub 0 256mb 300" >> /usr/local/etc/redis/redis.conf
 
 # Use the modified configuration file
 CMD ["redis-server", "/usr/local/etc/redis/redis.conf"]

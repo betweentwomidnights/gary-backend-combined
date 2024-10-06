@@ -30,12 +30,33 @@ def preprocess_audio(waveform):
 # Function to wrap audio if needed
 def wrap_audio_if_needed(waveform, sr, desired_duration):
     current_duration = waveform.shape[-1] / sr
-    while current_duration < desired_duration:
-        waveform = torch.cat([waveform, waveform[:, :int((desired_duration - current_duration) * sr)]], dim=-1)
-        current_duration = waveform.shape[-1] / sr
-    return waveform
+    
+    # If the current duration is already longer than or equal to the desired duration, return as is
+    if current_duration >= desired_duration:
+        return waveform
 
-def process_audio(input_data_base64, model_name, progress_callback=None, prompt_duration=6):
+    # Calculate how much silence is needed (in samples)
+    padding_duration = desired_duration - current_duration
+    padding_samples = int(padding_duration * sr)
+    
+    # Create a tensor of zeros (silence) with the necessary number of samples
+    silence = torch.zeros(1, padding_samples).to(waveform.device)  # Ensure it matches the device (GPU/CPU)
+    
+    # Append the silence to the original waveform
+    padded_waveform = torch.cat([waveform, silence], dim=-1)
+    
+    return padded_waveform
+
+def process_audio(
+    input_data_base64,
+    model_name,
+    progress_callback=None,
+    prompt_duration=6,
+    top_k=250,
+    temperature=1.0,
+    cfg_coef=3.0,
+    description=None  # New optional parameter
+):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
@@ -46,61 +67,84 @@ def process_audio(input_data_base64, model_name, progress_callback=None, prompt_
         song = song.cuda()  # Move the tensor to GPU for processing
 
         # Model's expected sample rate
-        expected_sr = 32000  # Adjust this value based on your model's requirements
+        expected_sr = 32000
 
         # Check if the input audio's sample rate matches the model's expected sample rate
         if sr != expected_sr:
-            # Resample the audio to match the model's expected sample rate
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=expected_sr).cuda()
             song_resampled = resampler(song)
-            del resampler  # Ensure resampler is deleted
+            del resampler
             torch.cuda.empty_cache()
         else:
             song_resampled = song
 
-        # Preprocess the resampled audio
         processed_waveform = preprocess_audio(song_resampled)
-
-        # Load the model
         model_continue = MusicGen.get_pretrained(model_name)
         model_continue.set_custom_progress_callback(progress_callback)
 
-        # Setting generation parameters
-        output_duration = song_resampled.shape[-1] / expected_sr
+        output_duration = 30.0  # Force output to be 30 seconds
+
+        # Use the parameters passed to the function
         model_continue.set_generation_params(
             use_sampling=True,
-            top_k=250,
+            top_k=top_k,
             top_p=0.0,
-            temperature=1.0,
+            temperature=temperature,
             duration=output_duration,
-            cfg_coef=3.0,
+            cfg_coef=cfg_coef,
         )
 
-        # Ensure the input waveform is long enough
         prompt_waveform = wrap_audio_if_needed(processed_waveform, expected_sr, prompt_duration + output_duration)
         prompt_waveform = prompt_waveform[..., :int(prompt_duration * expected_sr)]
 
-        # Generate the continuation
-        output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=expected_sr, progress=True)
+        # Use provided description if available, else use default based on model_name
+        if description:
+            final_description = description
+        elif model_name in ['thepatch/gary_orchestra', 'thepatch/gary_orchestra_2']:
+            final_description = "violin"
+        else:
+            final_description = None
 
-        # Convert output tensor to a compatible format before saving
-        output = output.float()  # Ensure dtype is torch.float32
-        # Convert the output tensor to a byte buffer
+        print(f"Generating continuation with description: {final_description}")
+        output = model_continue.generate_continuation(
+            prompt_waveform,
+            prompt_sample_rate=expected_sr,
+            descriptions=[final_description] if final_description else None,
+            progress=True
+        )
+
+        if output is None or output.size(0) == 0:
+            raise ValueError("Generated output is empty or None")
+
+        output = output.float()
         output_audio = io.BytesIO()
         torchaudio.save(output_audio, format='wav', src=output.cpu().squeeze(0), sample_rate=expected_sr)
         output_audio.seek(0)
         output_data_base64 = base64.b64encode(output_audio.read()).decode('utf-8')
 
+        print("Audio generation successful.")
+        return output_data_base64
+
+    except Exception as e:
+        print(f"Error during audio processing: {e}")
+        raise e
+
     finally:
-        # Cleanup to ensure all resources are freed
         input_audio.close()
         del model_continue, song, song_resampled, processed_waveform, prompt_waveform, output, input_data, output_audio
         torch.cuda.empty_cache()
         gc.collect()
 
-    return output_data_base64
-
-def continue_music(input_data_base64, musicgen_model, progress_callback=None, prompt_duration=6):
+def continue_music(
+    input_data_base64,
+    musicgen_model,
+    progress_callback=None,
+    prompt_duration=6,
+    top_k=250,
+    temperature=1.0,
+    cfg_coef=3.0,
+    description=None  # New optional parameter
+):
     # Decode the base64 input data
     input_data = base64.b64decode(input_data_base64)
     input_audio = io.BytesIO(input_data)
@@ -115,18 +159,37 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
 
         model_continue = MusicGen.get_pretrained(musicgen_model)
         model_continue.set_custom_progress_callback(progress_callback)
+
+        # Use the parameters passed to the function
         model_continue.set_generation_params(
             use_sampling=True,
-            top_k=250,
+            top_k=top_k,
             top_p=0.0,
-            temperature=1.0,
+            temperature=temperature,
             duration=30,  # Set duration explicitly
-            cfg_coef=3.0
+            cfg_coef=cfg_coef,
         )
 
         # Generate continuation
         prompt_waveform = song[:, -int(prompt_duration * sr):]
-        output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
+
+        # Use provided description if available, else use default based on model_name
+        if description:
+            final_description = description
+        elif musicgen_model in ['thepatch/gary_orchestra', 'thepatch/gary_orchestra_2']:
+            final_description = "violin, epic, film, piano, strings, orchestra"
+        else:
+            final_description = None
+
+        print(f"Generating continuation with description: {final_description}")
+
+        # Generate the continuation with dynamic description
+        output = model_continue.generate_continuation(
+            prompt_waveform,
+            prompt_sample_rate=sr,
+            descriptions=[final_description] if final_description else None,
+            progress=True
+        )
         output = output.squeeze(0) if output.dim() == 3 else output  # Ensure 2D tensor for audio
 
         # Resample output if necessary
@@ -145,10 +208,9 @@ def continue_music(input_data_base64, musicgen_model, progress_callback=None, pr
         # Concatenate tensors
         combined_waveform = torch.cat([original_minus_prompt, output], dim=1).to('cuda')
 
-
         # Convert output tensor to a compatible format before saving
         output = output.float()  # Ensure dtype is torch.float32
-        
+
         # Save output
         output_audio = io.BytesIO()
         torchaudio.save(output_audio, format='wav', src=combined_waveform.cpu(), sample_rate=sr)

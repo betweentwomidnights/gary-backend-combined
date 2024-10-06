@@ -1,0 +1,43 @@
+FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu20.04
+
+# Set environment variables to configure timezone non-interactively
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/New_York
+ENV USER=lyra
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libeigen3-dev \
+    libyaml-dev \
+    libfftw3-dev \
+    libtag1-dev \
+    libchromaprint-dev \
+    ffmpeg \
+    python3-pip \
+    tzdata \
+    micro
+
+RUN apt-get update && apt-get install -y bash
+
+# Set the working directory
+WORKDIR /workspace
+
+# Copy the repository contents into the workspace
+COPY . /workspace
+
+# Copy the requirements file and install Python dependencies
+COPY requirements-from_scratch.txt /workspace/requirements-from_scratch.txt
+RUN pip3 install --no-cache-dir -r requirements-from_scratch.txt
+
+# Copy the dataset (if applicable)
+COPY dataset /workspace/dataset
+
+# Make the scripts executable
+RUN chmod +x /workspace/from_scratch.py
+RUN chmod +x /workspace/review_chunks.py
+RUN chmod +x /workspace/fix_json.py
+RUN chmod +x /workspace/train-gary.py
+
+# Set entrypoint to /bin/bash to allow manual script execution
+ENTRYPOINT ["/bin/bash"]

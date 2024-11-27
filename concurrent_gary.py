@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import librosa
 import soundfile as sf
+from pydub import AudioSegment
+import io
+from typing import Optional, Tuple
 
 from rq import Queue, Retry
 from redis import Redis
@@ -19,18 +22,160 @@ from redis import Redis
 from pymongo import MongoClient, errors
 
 from bson import ObjectId, json_util
-import bson  # Import bson to handle bson-related errors
+import bson
 import re
 
 from g4laudio import continue_music
 import gc
 import time
+from urllib.parse import urlparse, parse_qs
+
+class YoutubeAudioProcessor:
+    def __init__(self, cache_dir: str = '/dataset/gary'):
+        self.cache_dir = cache_dir
+        self.expected_sr = 32000
+        self.max_file_size = 100 * 1024 * 1024  # 100MB limit
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def get_segment_info(self, youtube_url: str) -> dict:
+        """Get video duration and size information without downloading."""
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+        }
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            return {
+                'duration': info.get('duration', 0),
+                'filesize': info.get('filesize', 0)
+            }
+
+    def download_audio_segment(self, youtube_url: str, timestamp: float, duration: float = 30) -> str:
+        """Download only the required segment of audio."""
+        segment_file = os.path.join(
+            self.cache_dir, 
+            f"{base64.urlsafe_b64encode(f'{youtube_url}_{timestamp}_{duration}'.encode()).decode()}.mp3"
+        )
+
+        if os.path.exists(segment_file):
+            return segment_file
+
+        temp_file = os.path.join(self.cache_dir, 'temp_download.webm')
+        
+        # First, download the audio
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': temp_file,
+            'quiet': True,
+        }
+
+        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+
+        # Then use ffmpeg to extract the segment
+        start_time = str(timestamp)
+        duration_str = str(duration)
+        
+        ffmpeg_command = [
+            'ffmpeg', '-y',
+            '-ss', start_time,
+            '-t', duration_str,
+            '-i', temp_file,
+            '-acodec', 'libmp3lame',
+            '-ar', '44100',
+            '-ac', '2',
+            '-b:a', '192k',
+            segment_file
+        ]
+        
+        try:
+            import subprocess
+            subprocess.run(ffmpeg_command, check=True, capture_output=True)
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        return segment_file
+
+    def load_and_preprocess_audio(
+        self, 
+        file_path: str, 
+        prompt_length: float
+    ) -> Tuple[torch.Tensor, int]:
+        """Load and preprocess the audio segment."""
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Load audio in chunks to prevent memory issues
+        audio_segment = AudioSegment.from_mp3(file_path)
+        samples = torch.tensor(audio_segment.get_array_of_samples(), dtype=torch.float32)
+        
+        if audio_segment.channels == 2:
+            samples = samples.view(-1, 2).t()
+        else:
+            samples = samples.unsqueeze(0)
+        
+        # Convert to proper format and sample rate
+        samples = samples / (1 << (audio_segment.sample_width * 8 - 1))
+        samples = samples.to(device)
+
+        if audio_segment.frame_rate != self.expected_sr:
+            resampler = torchaudio.transforms.Resample(
+                audio_segment.frame_rate, 
+                self.expected_sr
+            ).to(device)
+            samples = resampler(samples)
+
+        # Ensure we only take the required prompt length
+        prompt_frames = int(prompt_length * self.expected_sr)
+        if samples.shape[1] > prompt_frames:
+            samples = samples[:, :prompt_frames]
+
+        return samples, self.expected_sr
+
+    def process_youtube_audio(
+        self, 
+        youtube_url: str, 
+        timestamp: float, 
+        prompt_length: float
+    ) -> Tuple[torch.Tensor, int]:
+        """Main processing pipeline."""
+        # First check video duration and estimate file size
+        info = self.get_segment_info(youtube_url)
+        
+        if info['duration'] < timestamp:
+            raise ValueError("Timestamp is beyond video duration")
+
+        # Download only the segment we need
+        segment_duration = prompt_length + 5  # Add a small buffer
+        segment_file = self.download_audio_segment(
+            youtube_url, 
+            timestamp, 
+            segment_duration
+        )
+
+        try:
+            # Process the audio segment
+            prompt_waveform, sr = self.load_and_preprocess_audio(
+                segment_file, 
+                prompt_length
+            )
+            return prompt_waveform, sr
+        finally:
+            # Clean up the segment file if it's not needed for caching
+            if not self.should_cache(info['filesize']):
+                os.remove(segment_file)
+
+    def should_cache(self, filesize: int) -> bool:
+        """Determine if the file should be cached based on size."""
+        return filesize < self.max_file_size
 
 # MongoDB connection with retry logic
 def get_mongo_client():
     try:
         client = MongoClient('mongodb://mongo:27017/', serverSelectionTimeoutMS=60000)
-        client.admin.command('ping')  # Check if the connection is established
+        client.admin.command('ping')
         return client
     except errors.ConnectionFailure as e:
         print(f"Could not connect to MongoDB: {e}")
@@ -52,61 +197,95 @@ q = Queue(connection=redis_conn)
 app = Flask(__name__)
 CORS(app)
 executor = ThreadPoolExecutor(max_workers=24)
+youtube_processor = YoutubeAudioProcessor()
 
-def is_valid_youtube_url(url):
-    youtube_regex = (
-        r'(https?://)?(www\.)?'
-        '(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?\s]{11})')
-    youtube_pattern = re.compile(youtube_regex)
-    return re.match(youtube_pattern, url) is not None
+class YouTubeURLHandler:
+    """Handles YouTube URL validation, normalization, and ID extraction."""
+    
+    # Supported YouTube domains
+    DOMAINS = {'youtube.com', 'youtu.be', 'm.youtube.com', 'music.youtube.com', 'www.youtube.com'}
+    
+    @staticmethod
+    def extract_video_id(url: str) -> Optional[str]:
+        """
+        Extracts video ID from various YouTube URL formats.
+        Returns None if no valid ID is found.
+        """
+        try:
+            # Parse the URL
+            parsed = urlparse(url)
+            
+            # Clean up the domain
+            hostname = parsed.netloc.lower()
+            if not any(domain in hostname for domain in YouTubeURLHandler.DOMAINS):
+                return None
+                
+            # Handle youtu.be format
+            if 'youtu.be' in hostname:
+                return parsed.path.strip('/')
+                
+            # Handle various youtube.com formats
+            if parsed.path.lower() in ['/watch', '/v/', '/embed/', '/shorts/']:
+                # Get video ID from query parameters
+                query = parse_qs(parsed.query)
+                return query.get('v', [None])[0]
+            
+            # Handle direct paths (/v/{id}, /embed/{id}, /shorts/{id})
+            path_parts = parsed.path.split('/')
+            if len(path_parts) >= 3:
+                return path_parts[2]
+                
+            return None
+            
+        except Exception:
+            return None
 
-def cleanup_files(*file_paths):
-    for file_path in file_paths:
-        if os.path.exists(file_path) and file_path.endswith('.webm'):
-            os.remove(file_path)
+    @staticmethod
+    def normalize_url(url: str) -> Optional[str]:
+        """
+        Normalizes YouTube URL to standard format.
+        Returns None if URL is invalid.
+        """
+        video_id = YouTubeURLHandler.extract_video_id(url)
+        if not video_id:
+            return None
+        return f"https://youtube.com/watch?v={video_id}"
 
-def download_audio(youtube_url):
-    cache_dir = '/dataset/gary'
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
+    @staticmethod
+    def validate_video_id(video_id: str) -> bool:
+        """Validates YouTube video ID format."""
+        return bool(re.match(r'^[a-zA-Z0-9_-]{11}$', video_id))
 
-    # Check Redis cache
-    audio_id = base64.urlsafe_b64encode(youtube_url.encode()).decode('utf-8')
-    cached_mp3_path = redis_conn.get(audio_id)
+    @staticmethod
+    def process_url(url: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Process a YouTube URL and return validation status, video ID, and normalized URL.
+        
+        Returns:
+            Tuple[bool, Optional[str], Optional[str]]: (is_valid, video_id, normalized_url)
+        """
+        if not url:
+            return False, None, None
+            
+        # Try to extract video ID
+        video_id = YouTubeURLHandler.extract_video_id(url)
+        if not video_id or not YouTubeURLHandler.validate_video_id(video_id):
+            return False, None, None
+            
+        # Generate normalized URL
+        normalized_url = f"https://youtube.com/watch?v={video_id}"
+        return True, video_id, normalized_url
 
-    if cached_mp3_path:
-        cached_mp3_path = cached_mp3_path.decode('utf-8')
-        if os.path.exists(cached_mp3_path):
-            print(f"Using cached audio for URL: {youtube_url}")
-            return cached_mp3_path
+def is_valid_youtube_url(url: str) -> bool:
+    """
+    Backwards-compatible function for existing code.
+    Returns True if URL is valid YouTube URL.
+    """
+    is_valid, _, _ = YouTubeURLHandler.process_url(url)
+    return is_valid
 
-    downloaded_mp3 = 'downloaded_audio.mp3'
-    downloaded_webm = 'downloaded_audio.webm'
-    cleanup_files(downloaded_webm)
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        'outtmpl': 'downloaded_audio.%(ext)s',
-        'keepvideo': False,
-    }
-
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
-
-    # Move the downloaded file to the cache directory
-    cached_mp3_path = os.path.join(cache_dir, f'{audio_id}.mp3')
-    os.rename(downloaded_mp3, cached_mp3_path)
-    cleanup_files(downloaded_webm)
-
-    # Store the cached file path in Redis
-    redis_conn.set(audio_id, cached_mp3_path)
-
-    return cached_mp3_path
-
-def get_bpm(cached_mp3_path):
-    audio, sr = librosa.load(cached_mp3_path, sr=None)
+def get_bpm(audio_file):
+    audio, sr = librosa.load(audio_file, sr=None)
     onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
     tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
     if 120 < tempo < 200:
@@ -128,46 +307,34 @@ def calculate_duration(bpm, min_duration, max_duration):
 
     return duration
 
-def load_and_preprocess_audio(file_path, timestamp, promptLength):
-    song, sr = torchaudio.load(file_path)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    song = song.to(device)
-    expected_sr = 32000
-    if sr != expected_sr:
-        resampler = T.Resample(sr, expected_sr).to(device)
-        song = resampler(song)
-        sr = expected_sr
-
-    # Convert timestamp (seconds) to frames
-    frame_offset = int(timestamp * sr)
-
-    # Check if waveform duration after timestamp is less than 30 seconds
-    if song.shape[1] - frame_offset < 30 * sr:
-        # Wrap around to the beginning of the mp3
-        song = torch.cat((song[:, frame_offset:], song[:, :30 * sr - (song.shape[1] - frame_offset)]), dim=1)
-    else:
-        song = song[:, frame_offset:frame_offset + 30 * sr]
-
-    # Define the prompt length
-    prompt_length = promptLength * sr
-
-    # Create the prompt waveform
-    prompt_waveform = song[:, :prompt_length] if song.shape[1] > prompt_length else song
-
-    return prompt_waveform, sr
-
 def generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration, progress_callback=None):
-    # Calculate the duration to end at a bar
-    duration = calculate_duration(bpm, min_duration, max_duration)
+    try:
+        duration = calculate_duration(bpm, min_duration, max_duration)
 
-    # Use a new CUDA stream for this task
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        model_continue = MusicGen.get_pretrained(model)
-        model_continue.set_custom_progress_callback(progress_callback)
-        model_continue.set_generation_params(use_sampling=True, top_k=250, top_p=0.0, temperature=1.0, duration=duration, cfg_coef=3)
-        output = model_continue.generate_continuation(prompt_waveform, prompt_sample_rate=sr, progress=True)
-    return output.cpu().squeeze(0)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            model_continue = MusicGen.get_pretrained(model)
+            model_continue.set_custom_progress_callback(progress_callback)
+            model_continue.set_generation_params(
+                use_sampling=True, 
+                top_k=150, 
+                top_p=0.0, 
+                temperature=1.0, 
+                duration=duration, 
+                cfg_coef=5
+            )
+            
+            description = "drums, percussion"
+            output = model_continue.generate_continuation(
+                prompt_waveform, 
+                prompt_sample_rate=sr, 
+                descriptions=[description] if description else None,
+                progress=True
+            )
+        return output.cpu().squeeze(0)
+    except Exception as e:
+        print(f"Error in generate_audio_continuation: {e}")
+        raise
 
 def save_generated_audio(output, sr):
     output_filename = 'generated_continuation'
@@ -179,19 +346,35 @@ def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duratio
         def progress_callback(current_step, total_steps):
             progress_percent = (current_step / total_steps) * 100
             print(f"Progress: {progress_percent}% for task {task_id}")
-            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)  # Set progress with a TTL of 600 seconds
+            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)
 
-        cached_mp3_path = download_audio(youtube_url)
-        bpm = get_bpm(cached_mp3_path)
-        prompt_waveform, sr = load_and_preprocess_audio(cached_mp3_path, timestamp, promptLength)
-        output = generate_audio_continuation(prompt_waveform, sr, bpm, model, min_duration, max_duration, progress_callback)
+        # Use the new YouTube processor
+        prompt_waveform, sr = youtube_processor.process_youtube_audio(
+            youtube_url, 
+            timestamp, 
+            promptLength
+        )
+
+        # Get BPM from the downloaded segment
+        segment_file = youtube_processor.download_audio_segment(youtube_url, timestamp, 30)
+        bpm = get_bpm(segment_file)
+
+        # Generate continuation
+        output = generate_audio_continuation(
+            prompt_waveform, 
+            sr, 
+            bpm, 
+            model, 
+            min_duration, 
+            max_duration, 
+            progress_callback
+        )
+        
         output_filename = save_generated_audio(output, sr)
 
-        # Encode the audio data
         with open(output_filename, 'rb') as audio_file:
             encoded_audio = base64.b64encode(audio_file.read()).decode('utf-8')
 
-        # Save task info, audio reference, and status in MongoDB
         audio_tasks.update_one(
             {'_id': ObjectId(task_id)},
             {'$set': {'output_filename': output_filename, 'status': 'completed', 'audio': encoded_audio}}
@@ -200,10 +383,9 @@ def process_youtube_url(youtube_url, timestamp, model, promptLength, min_duratio
         return output_filename
     except Exception as e:
         print(f"Error processing YouTube URL: {e}")
-        # Update the task status in MongoDB in case of an error
         audio_tasks.update_one(
             {'_id': ObjectId(task_id)},
-            {'$set': {'status': 'failed'}}
+            {'$set': {'status': 'failed', 'error': str(e)}}
         )
         return None
 
@@ -212,7 +394,7 @@ def process_continuation(task_id, input_data_base64, musicgen_model, prompt_dura
         def progress_callback(current_step, total_steps):
             progress_percent = (current_step / total_steps) * 100
             print(f"Progress: {progress_percent}% for task {task_id}")
-            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)  # Set progress with a TTL of 600 seconds
+            redis_conn.set(f"progress_{task_id}", progress_percent, ex=600)
 
         print(f"Memory before DB find: {torch.cuda.memory_allocated()} bytes")
         task = audio_tasks.find_one({'_id': ObjectId(task_id)})
@@ -221,7 +403,13 @@ def process_continuation(task_id, input_data_base64, musicgen_model, prompt_dura
             print("Task not found")
             return None
 
-        output_data_base64 = continue_music(input_data_base64, musicgen_model, progress_callback=progress_callback, prompt_duration=prompt_duration)
+        output_data_base64 = continue_music(
+            input_data_base64, 
+            musicgen_model, 
+            progress_callback=progress_callback, 
+            prompt_duration=prompt_duration
+        )
+        
         task['audio'] = output_data_base64
         task['status'] = 'completed'
 
@@ -232,10 +420,9 @@ def process_continuation(task_id, input_data_base64, musicgen_model, prompt_dura
         return output_data_base64
     except Exception as e:
         print(f"Error processing continuation: {e}")
-        # Update the task status in MongoDB in case of an error
         audio_tasks.update_one(
             {'_id': ObjectId(task_id)},
-            {'$set': {'status': 'failed'}}
+            {'$set': {'status': 'failed', 'error': str(e)}}
         )
         return None
 
@@ -248,19 +435,27 @@ def generate_audio():
     promptLength = int(data.get('promptLength', 6))
     duration = data.get('duration', '16-18').split('-')
 
-    # Ensure that duration is correctly parsed and handled
     min_duration = int(duration[0])
     max_duration = int(duration[1])
 
-    # Validate YouTube URL
-    if not is_valid_youtube_url(youtube_url):
+    is_valid, video_id, normalized_url = YouTubeURLHandler.process_url(youtube_url)
+    if not is_valid:
         return jsonify({"error": "Invalid YouTube URL"}), 400
+        
+    # Use normalized URL for further processing
+    youtube_url = normalized_url  # This ensures consistent URL format
 
-    # Validate timestamp
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
         return jsonify({"error": "Invalid timestamp"}), 400
 
-    # Save task info in MongoDB
+    # Check video duration before proceeding
+    try:
+        info = youtube_processor.get_segment_info(youtube_url)
+        if info['duration'] < timestamp:
+            return jsonify({"error": "Timestamp is beyond video duration"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Error accessing video: {str(e)}"}), 400
+
     audio_task = {
         'rq_job_id': None,
         'youtube_url': youtube_url,
@@ -269,7 +464,6 @@ def generate_audio():
     }
     task_id = audio_tasks.insert_one(audio_task).inserted_id
 
-    # Enqueue the task with retry logic
     job = q.enqueue(
         process_youtube_url,
         youtube_url,
@@ -283,8 +477,10 @@ def generate_audio():
         retry=Retry(max=3)
     )
 
-    # Update the job ID in the MongoDB task record
-    audio_tasks.update_one({'_id': ObjectId(task_id)}, {'$set': {'rq_job_id': job.get_id()}})
+    audio_tasks.update_one(
+        {'_id': ObjectId(task_id)}, 
+        {'$set': {'rq_job_id': job.get_id()}}
+    )
 
     return jsonify({"task_id": str(task_id)})
 

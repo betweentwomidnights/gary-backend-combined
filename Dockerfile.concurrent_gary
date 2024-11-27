@@ -27,11 +27,16 @@ RUN wget https://bootstrap.pypa.io/get-pip.py && python3.9 get-pip.py && rm get-
 RUN python3.9 -m pip install --upgrade pip
 RUN python3.9 -m pip install setuptools wheel
 
+# Install numpy using a later version (or try with 1.24.0)
+RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
+
 # Copy the requirements file into the container
 COPY requirements-concurrent_gary.txt ./
 
 # Install Python dependencies
 RUN python3.9 -m pip install --no-cache-dir -r requirements-concurrent_gary.txt
+
+RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
 
 # Verify gunicorn installation and list installed packages
 RUN python3.9 -m pip show gunicorn

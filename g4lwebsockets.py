@@ -1,3 +1,6 @@
+import gevent.monkey
+gevent.monkey.patch_all()
+
 from flask import Flask, jsonify, request, copy_current_request_context
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import gevent
@@ -13,6 +16,7 @@ from flask_cors import CORS  # Import CORS
 import json
 
 from typing import Optional
+from datetime import datetime, timezone, timedelta
 # MongoDB setup
 # THIS IS THE LOCAL VERSION
 # client = MongoClient('mongodb://localhost:27017/')
@@ -30,8 +34,17 @@ redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 # THIS IS THE LOCAL VERSION
-# socketio = SocketIO(app, message_queue='redis://localhost:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=16*1024*1024)
-socketio = SocketIO(app, message_queue='redis://redis:6379', async_mode='gevent', cors_allowed_origins="*", logger=True, engineio_logger=True, pingTimeout=240000, pingInterval=120000, max_http_buffer_size=64*1024*1024)
+socketio = SocketIO(
+    app,
+    message_queue='redis://redis:6379',
+    async_mode='gevent',
+    cors_allowed_origins="*",
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=240,  # Use snake_case
+    ping_interval=120,  # Use snake_case
+    max_http_buffer_size=64*1024*1024
+)
 
 @app.route('/')
 def index():
@@ -84,7 +97,20 @@ def retrieve_audio_from_gridfs(file_id):
 def store_audio_data(session_id, audio_data, key):
     """Store session data in MongoDB with GridFS."""
     file_id = store_audio_in_gridfs(audio_data, f"{session_id}_{key}.wav")
-    sessions.update_one({'_id': session_id}, {'$set': {key: file_id}}, upsert=True)
+    current_time = datetime.now(timezone.utc)
+    sessions.update_one(
+        {'_id': session_id}, 
+        {
+            '$set': {
+                key: file_id,
+                'updated_at': current_time
+            },
+            '$setOnInsert': {
+                'created_at': current_time
+            }
+        }, 
+        upsert=True
+    )
 
 def retrieve_audio_data(session_id, key):
     """Retrieve specific audio data from MongoDB."""
@@ -145,6 +171,11 @@ def handle_audio_processing(data):
             return
 
         join_room(session_id)
+
+        # Emit the session ID immediately after generation and joining the room
+        emit('process_audio_received', {'session_id': session_id})
+        print(f"Emitted process_audio_received for session {session_id}")
+
         input_data_base64 = request_data.audio_data
         model_name = request_data.model_name
         prompt_duration = request_data.prompt_duration
@@ -228,6 +259,9 @@ def handle_continue_music(data):
         if is_generation_in_progress(session_id):
             emit('error', {'message': 'Generation already in progress', 'session_id': session_id}, room=session_id)
             return
+
+        emit('continue_music_received', {'session_id': session_id, 'message': 'Starting continuation'})
+        print(f"Emitted continue_music_received for session {session_id}")
 
         # Use 'audio_data' from data if available, else retrieve from session
         if request_data.audio_data:
@@ -358,6 +392,9 @@ def handle_retry_music(data):
         prompt_duration = request_data.prompt_duration or sessions.find_one({'_id': session_id}).get('prompt_duration')
 
         print(f"Retrying music for session {session_id} with model_name: {model_name}, prompt_duration: {prompt_duration}")
+        emit('retry_music_received', {'session_id': session_id}, room=session_id)
+        print(f"Emitted retry_music_received for session {session_id}")
+
 
         set_generation_in_progress(session_id, True)
 
@@ -395,32 +432,233 @@ def handle_retry_music(data):
 @socketio.on('update_cropped_audio')
 def handle_update_cropped_audio(data):
     try:
-        # Check if the received data is a string (raw JSON string from Swift)
         if isinstance(data, str):
-            # Remove both single and double backslashes
             clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            # Parse the cleaned raw JSON string into a dictionary
             try:
                 data = json.loads(clean_data)
             except json.JSONDecodeError as e:
                 emit('error', {'message': 'Invalid JSON format: ' + str(e)})
                 return
 
-        # Proceed with the usual flow
         request_data = SessionRequest(**data)
         session_id = request_data.session_id
-        audio_data_base64 = data.get('audio_data')  # Use get method to safely retrieve audio_data
+        audio_data_base64 = data.get('audio_data')
 
-        if session_id and audio_data_base64:
-            store_audio_data(session_id, audio_data_base64, 'last_processed_audio')
-            emit('update_cropped_audio_complete', {'message': 'Cropped audio updated', 'session_id': session_id}, room=session_id)
-            print(f"Cropped audio updated for session {session_id}")
-        else:
+        if not session_id or not audio_data_base64:
             raise ValueError("Missing session_id or audio_data")
+
+        # Validate session exists
+        session = sessions.find_one({'_id': session_id})
+        if not session:
+            raise ValueError("Invalid session ID")
+
+        # Check file size
+        data_size_bytes = len(audio_data_base64.encode('utf-8'))
+        max_size_bytes = 64 * 1024 * 1024  # 64 MB
+
+        if data_size_bytes > max_size_bytes:
+            emit('error', {
+                'message': 'Cropped audio data is too large',
+                'code': 'DATA_TOO_LARGE',
+                'session_id': session_id
+            }, room=session_id)
+            return
+
+        store_audio_data(session_id, audio_data_base64, 'last_processed_audio')
+        emit('update_cropped_audio_complete', {
+            'message': 'Cropped audio updated',
+            'session_id': session_id,
+            'data_size': data_size_bytes
+        }, room=session_id)
+        
+        print(f"Cropped audio updated for session {session_id}")
+        
     except Exception as e:
         session_id = data.get('session_id') if isinstance(data, dict) else 'unknown'
         print(f"Error in update_cropped_audio for session {session_id}: {e}")
         emit('error', {'message': str(e), 'session_id': session_id})
+
+@socketio.on('restore_processed_audio')
+def handle_restore_processed_audio(data):
+    try:
+        if isinstance(data, str):
+            clean_data = data.replace("\\\\", "\\").replace("\\", "")
+            try:
+                data = json.loads(clean_data)
+            except json.JSONDecodeError as e:
+                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
+                return
+
+        # Get the audio data size
+        audio_data_base64 = data.get('audio_data')
+        if not audio_data_base64:
+            raise ValueError("Missing audio data")
+
+        # Check file size before processing
+        data_size_bytes = len(audio_data_base64.encode('utf-8'))
+        max_size_bytes = 64 * 1024 * 1024  # 64 MB
+
+        if data_size_bytes > max_size_bytes:
+            emit('error', {
+                'message': 'Audio data is too large to restore',
+                'code': 'DATA_TOO_LARGE'
+            })
+            return
+
+        # Create a new session for the restored audio
+        session_id = generate_session_id()
+        join_room(session_id)
+
+        model_name = data.get('model_name', '').replace("\\", "").strip()
+        prompt_duration = data.get('prompt_duration')
+
+        if not all([model_name, prompt_duration]):
+            raise ValueError("Missing required parameters")
+
+        # Store the audio data in the new session
+        store_audio_data(session_id, audio_data_base64, 'last_processed_audio')
+        
+        # Store session settings
+        sessions.update_one(
+            {'_id': session_id},
+            {
+                '$set': {
+                    'model_name': model_name,
+                    'prompt_duration': prompt_duration,
+                    'restored': True  # Flag to indicate this is a restored session
+                }
+            },
+            upsert=True
+        )
+
+        emit('restore_complete', {
+            'message': 'Audio restored successfully',
+            'session_id': session_id,
+            'data_size': data_size_bytes
+        }, room=session_id)
+
+    except Exception as e:
+        print(f"Error in restore_processed_audio: {e}")
+        emit('error', {'message': str(e)})
+
+@socketio.on('begin_restore_audio')
+def handle_begin_restore(data):
+    try:
+        session_id = generate_session_id()
+        join_room(session_id)
+        
+        redis_client.set(f"{session_id}_restore_chunks", "")
+        
+        emit('ready_for_chunks', {
+            'session_id': session_id,
+            'chunk_size': 8 * 1024 * 1024  # 8MB chunks
+        })
+        
+    except Exception as e:
+        emit('error', {'message': str(e)})
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    try:
+        # Handle string input just like restore_processed_audio
+        if isinstance(data, str):
+            clean_data = data.replace("\\\\", "\\").replace("\\", "")
+            try:
+                data = json.loads(clean_data)
+            except json.JSONDecodeError as e:
+                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
+                return
+        
+        session_id = data.get('session_id')
+        chunk = data.get('chunk')
+        chunk_index = data.get('chunk_index')
+        total_chunks = data.get('total_chunks')
+        is_last = data.get('is_last', False)
+        
+        if not all([session_id, chunk, isinstance(chunk_index, int), isinstance(total_chunks, int)]):
+            raise ValueError("Missing required chunk data")
+
+        # Store chunk with a longer expiration time
+        chunk_key = f"{session_id}_chunk_{chunk_index}"
+        redis_client.setex(chunk_key, 3600, chunk)  # 1 hour expiration
+        
+        # Track received chunks in a Redis set
+        received_chunks_key = f"{session_id}_received_chunks_set"
+        redis_client.sadd(received_chunks_key, chunk_index)
+        redis_client.expire(received_chunks_key, 3600)  # 1 hour expiration
+
+        # Get count of received chunks
+        received_count = redis_client.scard(received_chunks_key)
+        
+        # Acknowledge receipt
+        emit('chunk_received', {
+            'session_id': session_id,
+            'chunk_index': chunk_index,
+            'total_chunks': total_chunks,
+            'received_chunks': received_count
+        })
+
+        print(f"Stored chunk {chunk_index} of {total_chunks} for session {session_id}")
+        print(f"Received chunks count: {received_count}")
+
+        # If this is the last chunk or we have all chunks, process them
+        if is_last or received_count == total_chunks:
+            # Verify we have all chunks
+            all_chunks_present = True
+            missing_chunks = []
+            
+            for i in range(total_chunks):
+                chunk_exists = redis_client.exists(f"{session_id}_chunk_{i}")
+                if not chunk_exists:
+                    all_chunks_present = False
+                    missing_chunks.append(i)
+                    print(f"Missing chunk {i} for session {session_id}")
+
+            if all_chunks_present:
+                # Combine all chunks in order
+                complete_audio = []
+                for i in range(total_chunks):
+                    chunk_key = f"{session_id}_chunk_{i}"
+                    chunk_data = redis_client.get(chunk_key)
+                    if chunk_data:
+                        complete_audio.append(chunk_data.decode('utf-8'))
+                        redis_client.delete(chunk_key)
+                    
+                # Clean up
+                redis_client.delete(received_chunks_key)
+                
+                # Store the complete audio
+                complete_audio_data = ''.join(complete_audio)
+                store_audio_data(session_id, complete_audio_data, 'last_processed_audio')
+                
+                # Store session settings
+                if data.get('model_name') and data.get('prompt_duration'):
+                    sessions.update_one(
+                        {'_id': session_id},
+                        {
+                            '$set': {
+                                'model_name': data.get('model_name'),
+                                'prompt_duration': data.get('prompt_duration'),
+                                'restored': True
+                            }
+                        },
+                        upsert=True
+                    )
+                
+                emit('restore_complete', {
+                    'message': 'Audio restored successfully',
+                    'session_id': session_id
+                }, room=session_id)
+            else:
+                # Request missing chunks
+                emit('chunks_missing', {
+                    'session_id': session_id,
+                    'missing_chunks': missing_chunks
+                })
+                
+    except Exception as e:
+        print(f"Error in handle_audio_chunk: {e}")
+        emit('error', {'message': str(e)})
 
 # Robust Health Check Route
 @app.route('/health', methods=['GET'])
@@ -454,6 +692,64 @@ def health_check():
         health_status['status'] = 'degraded'
 
     return jsonify(health_status), 200 if health_status['status'] == 'live' else 500
+
+@app.route('/api/latest_generated_audio/<session_id>', methods=['GET'])
+def get_latest_generated_audio(session_id):
+    """
+    Retrieve the most recently generated audio for a session if generation completed.
+    This endpoint is specifically for recovering audio that was generated while the app was minimized.
+    """
+    try:
+        # Check if generation is still in progress
+        if is_generation_in_progress(session_id):
+            return jsonify({
+                'status': 'in_progress',
+                'message': 'Audio generation still in progress'
+            }), 202
+        
+        # Retrieve the session data
+        session_data = sessions.find_one({'_id': session_id})
+        if not session_data:
+            return jsonify({
+                'status': 'not_found',
+                'message': 'Session not found'
+            }), 404
+
+        # Get the most recently processed audio
+        audio_data = retrieve_audio_data(session_id, 'last_processed_audio')
+        if not audio_data:
+            return jsonify({
+                'status': 'no_audio',
+                'message': 'No processed audio found for this session'
+            }), 404
+
+        # Return the audio data along with session parameters needed for restoration
+        return jsonify({
+            'status': 'success',
+            'audio_data': audio_data,
+            'model_name': session_data.get('model_name'),
+            'prompt_duration': session_data.get('prompt_duration'),
+            'session_id': session_id
+        }), 200
+
+    except Exception as e:
+        print(f"Error retrieving latest generated audio for session {session_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+# Add a cleanup mechanism to remove old sessions
+@app.route('/api/cleanup_old_sessions', methods=['POST'])
+def cleanup_old_sessions():
+    threshold_time = datetime.now(timezone.utc) - timedelta(hours=24)
+    result = sessions.delete_many({
+        'created_at': {'$lt': threshold_time}
+    })
+    return jsonify({
+        'status': 'success',
+        'deleted_count': result.deleted_count
+    }), 200
 
 if __name__ == '__main__':
     socketio.run(app, debug=False)

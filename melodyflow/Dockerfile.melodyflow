@@ -1,0 +1,40 @@
+# Use NVIDIA CUDA base image with Python
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    git \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch with CUDA first
+RUN pip3 install torch==2.4.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Copy and install requirements
+COPY requirements-melodyflow.txt .
+RUN pip3 install -r requirements-melodyflow.txt waitress
+
+# Copy necessary files from your local MelodyFlow directory
+COPY flask_melodyflow_2.py .
+COPY variations.py .
+COPY audiocraft ./audiocraft
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0
+
+# Expose the port the app runs on
+EXPOSE 8002
+
+# Copy and set up entrypoint script
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+# Set entrypoint
+ENTRYPOINT ["./entrypoint.sh"]

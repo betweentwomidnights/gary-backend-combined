@@ -75,3 +75,8 @@ g4c/
 *.Zone.Identifier
 *.pb
 *Zone.Identifier
+
+#ignore musicgen style and points-db
+style_outputs/
+synth_versions/
+points_service.py

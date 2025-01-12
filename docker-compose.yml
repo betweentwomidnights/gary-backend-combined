@@ -1,0 +1,58 @@
+version: '3.8'
+services:
+  g4lwebsockets:
+    image: thecollabagepatch/g4lwebsockets:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.g4lwebsockets
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV_VARIABLE=value
+    depends_on:
+      - redis
+      - mongo
+      - melodyflow
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  melodyflow:
+    image: thecollabagepatch/melodyflow:latest
+    ports:
+      - "8002:8002"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: thecollabagepatch/redis:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    ports:
+      - "6379:6379"
+
+  mongo:
+    image: "mongo:latest"
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+volumes:
+  mongo-data:

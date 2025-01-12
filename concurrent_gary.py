@@ -35,52 +35,134 @@ class YoutubeAudioProcessor:
         self.cache_dir = cache_dir
         self.expected_sr = 32000
         self.max_file_size = 100 * 1024 * 1024  # 100MB limit
+        self.format_options = [
+            'bestaudio/best',
+            'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio',
+            'worstaudio[ext=webm]/worstaudio[ext=m4a]/worstaudio',
+            'bestaudio[acodec=opus]/bestaudio[acodec=vorbis]/bestaudio'
+        ]
         os.makedirs(cache_dir, exist_ok=True)
 
-    def get_segment_info(self, youtube_url: str) -> dict:
+    def get_segment_info(self, youtube_url: str, extra_options: Optional[dict] = None) -> dict:
         """Get video duration and size information without downloading."""
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
         }
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
-            return {
-                'duration': info.get('duration', 0),
-                'filesize': info.get('filesize', 0)
-            }
+        if extra_options:
+            ydl_opts.update(extra_options)
 
-    def download_audio_segment(self, youtube_url: str, timestamp: float, duration: float = 30) -> str:
-        """Download only the required segment of audio."""
+        for attempt in range(2):  # Try with and without signature verification
+            try:
+                with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(youtube_url, download=False)
+                    return {
+                        'duration': info.get('duration', 0),
+                        'filesize': info.get('filesize', 0)
+                    }
+            except Exception as e:
+                if attempt == 0:
+                    # Try again with signature verification disabled
+                    ydl_opts.update({
+                        'nocheckcertificate': True,
+                        'no_check_certificate': True
+                    })
+                else:
+                    raise e
+        
+        return {'duration': 0, 'filesize': 0}  # Fallback values
+
+    def _try_download_with_format(
+        self, 
+        youtube_url: str, 
+        temp_file: str, 
+        format_option: str,
+        extra_options: Optional[dict] = None
+    ) -> bool:
+        """Attempt to download with specific format options."""
+        ydl_opts = {
+            'format': format_option,
+            'outtmpl': temp_file,
+            'quiet': True,
+            'no_warnings': True
+        }
+        if extra_options:
+            ydl_opts.update(extra_options)
+
+        try:
+            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([youtube_url])
+                return os.path.exists(temp_file)
+        except Exception as e:
+            print(f"Download failed with format {format_option}: {str(e)}")
+            return False
+
+    def download_audio_segment(
+        self, 
+        youtube_url: str, 
+        timestamp: float, 
+        duration: float = 30,
+        format_option: Optional[str] = None,
+        extra_options: Optional[dict] = None
+    ) -> str:
+        """Download only the required segment of audio with multiple fallback options."""
         segment_file = os.path.join(
             self.cache_dir, 
             f"{base64.urlsafe_b64encode(f'{youtube_url}_{timestamp}_{duration}'.encode()).decode()}.mp3"
         )
 
         if os.path.exists(segment_file):
-            return segment_file
+            try:
+                # Verify the existing file
+                AudioSegment.from_mp3(segment_file)
+                return segment_file
+            except Exception:
+                os.remove(segment_file)
 
         temp_file = os.path.join(self.cache_dir, 'temp_download.webm')
-        
-        # First, download the audio
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': temp_file,
-            'quiet': True,
-        }
+        download_success = False
 
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([youtube_url])
+        # Try with provided format first
+        if format_option:
+            download_success = self._try_download_with_format(
+                youtube_url, temp_file, format_option, extra_options
+            )
 
-        # Then use ffmpeg to extract the segment
-        start_time = str(timestamp)
-        duration_str = str(duration)
-        
+        # Try all format options
+        if not download_success:
+            for fmt in self.format_options:
+                download_success = self._try_download_with_format(
+                    youtube_url, temp_file, fmt, extra_options
+                )
+                if download_success:
+                    break
+
+        # Try with signature verification disabled
+        if not download_success and (not extra_options or 
+            not extra_options.get('nocheckcertificate')):
+            no_verify_opts = {
+                'nocheckcertificate': True,
+                'no_check_certificate': True
+            }
+            if extra_options:
+                no_verify_opts.update(extra_options)
+
+            for fmt in self.format_options:
+                download_success = self._try_download_with_format(
+                    youtube_url, temp_file, fmt, no_verify_opts
+                )
+                if download_success:
+                    break
+
+        if not download_success:
+            raise RuntimeError("Failed to download audio after all attempts")
+
+        # Extract the segment using ffmpeg
         ffmpeg_command = [
             'ffmpeg', '-y',
-            '-ss', start_time,
-            '-t', duration_str,
+            '-ss', str(timestamp),
+            '-t', str(duration),
             '-i', temp_file,
             '-acodec', 'libmp3lame',
             '-ar', '44100',
@@ -97,6 +179,9 @@ class YoutubeAudioProcessor:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
 
+        if not os.path.exists(segment_file):
+            raise RuntimeError("Failed to extract audio segment")
+
         return segment_file
 
     def load_and_preprocess_audio(
@@ -104,55 +189,76 @@ class YoutubeAudioProcessor:
         file_path: str, 
         prompt_length: float
     ) -> Tuple[torch.Tensor, int]:
-        """Load and preprocess the audio segment."""
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        """Load and preprocess the audio segment with better error handling."""
+        max_retries = 3
+        last_error = None
         
-        # Load audio in chunks to prevent memory issues
-        audio_segment = AudioSegment.from_mp3(file_path)
-        samples = torch.tensor(audio_segment.get_array_of_samples(), dtype=torch.float32)
-        
-        if audio_segment.channels == 2:
-            samples = samples.view(-1, 2).t()
-        else:
-            samples = samples.unsqueeze(0)
-        
-        # Convert to proper format and sample rate
-        samples = samples / (1 << (audio_segment.sample_width * 8 - 1))
-        samples = samples.to(device)
+        for attempt in range(max_retries):
+            try:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                
+                # Load audio in chunks
+                audio_segment = AudioSegment.from_mp3(file_path)
+                samples = torch.tensor(audio_segment.get_array_of_samples(), dtype=torch.float32)
+                
+                if audio_segment.channels == 2:
+                    samples = samples.view(-1, 2).t()
+                else:
+                    samples = samples.unsqueeze(0)
+                
+                # Convert to proper format and sample rate
+                samples = samples / (1 << (audio_segment.sample_width * 8 - 1))
+                samples = samples.to(device)
 
-        if audio_segment.frame_rate != self.expected_sr:
-            resampler = torchaudio.transforms.Resample(
-                audio_segment.frame_rate, 
-                self.expected_sr
-            ).to(device)
-            samples = resampler(samples)
+                if audio_segment.frame_rate != self.expected_sr:
+                    resampler = torchaudio.transforms.Resample(
+                        audio_segment.frame_rate, 
+                        self.expected_sr
+                    ).to(device)
+                    samples = resampler(samples)
 
-        # Ensure we only take the required prompt length
-        prompt_frames = int(prompt_length * self.expected_sr)
-        if samples.shape[1] > prompt_frames:
-            samples = samples[:, :prompt_frames]
+                # Take required prompt length
+                prompt_frames = int(prompt_length * self.expected_sr)
+                if samples.shape[1] > prompt_frames:
+                    samples = samples[:, :prompt_frames]
+                elif samples.shape[1] < prompt_frames:
+                    # Pad if too short
+                    pad_frames = prompt_frames - samples.shape[1]
+                    samples = torch.nn.functional.pad(samples, (0, pad_frames))
 
-        return samples, self.expected_sr
+                return samples, self.expected_sr
+                
+            except Exception as e:
+                last_error = e
+                print(f"Attempt {attempt + 1} failed: {str(e)}")
+                time.sleep(1)  # Brief delay between retries
+                continue
+                
+        raise RuntimeError(f"Failed to process audio after {max_retries} attempts: {str(last_error)}")
 
     def process_youtube_audio(
         self, 
         youtube_url: str, 
         timestamp: float, 
-        prompt_length: float
+        prompt_length: float,
+        format_option: Optional[str] = None,
+        extra_options: Optional[dict] = None
     ) -> Tuple[torch.Tensor, int]:
-        """Main processing pipeline."""
-        # First check video duration and estimate file size
-        info = self.get_segment_info(youtube_url)
+        """Main processing pipeline with improved error handling."""
+        # Check video duration and estimate file size
+        info = self.get_segment_info(youtube_url, extra_options)
         
-        if info['duration'] < timestamp:
+        if info['duration'] and info['duration'] < timestamp:
             raise ValueError("Timestamp is beyond video duration")
 
-        # Download only the segment we need
-        segment_duration = prompt_length + 5  # Add a small buffer
+        # Download segment with buffer
+        segment_duration = prompt_length + 5
         segment_file = self.download_audio_segment(
             youtube_url, 
             timestamp, 
-            segment_duration
+            segment_duration,
+            format_option,
+            extra_options
         )
 
         try:
@@ -163,9 +269,12 @@ class YoutubeAudioProcessor:
             )
             return prompt_waveform, sr
         finally:
-            # Clean up the segment file if it's not needed for caching
+            # Clean up if not caching
             if not self.should_cache(info['filesize']):
-                os.remove(segment_file)
+                try:
+                    os.remove(segment_file)
+                except Exception as e:
+                    print(f"Failed to clean up segment file: {str(e)}")
 
     def should_cache(self, filesize: int) -> bool:
         """Determine if the file should be cached based on size."""

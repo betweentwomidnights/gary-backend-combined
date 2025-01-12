@@ -1,0 +1,36 @@
+# web server components
+
+flask
+flask_cors
+flask-socketio
+psutil
+
+
+# please make sure you have already a pytorch install that is cuda enabled!
+av
+einops
+flashy>=0.0.1
+hydra-core>=1.1
+hydra_colorlog
+julius
+num2words
+numpy
+sentencepiece
+spacy>=3.6.1
+torch==2.4.0
+torchaudio
+huggingface_hub
+tqdm
+transformers>=4.31.0  # need Encodec there.
+xformers
+demucs
+librosa
+soundfile
+gradio
+torchmetrics
+encodec
+protobuf
+torchvision
+torchtext
+pesq
+pystoi

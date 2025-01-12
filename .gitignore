@@ -80,3 +80,8 @@ g4c/
 style_outputs/
 synth_versions/
 points_service.py
+
+*.wav
+gidder.wav
+cc2_7.wav
+cc2_10.wav

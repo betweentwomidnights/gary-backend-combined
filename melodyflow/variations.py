@@ -30,7 +30,7 @@ VARIATIONS = {
         'flowstep': 0.13,
         'steps': 25
     },
-    
+
     # Synthesizer Variations
     'synth_retro': {
         'prompt': "1980s style synthesizer melody with warm analog pads and arpeggios, perfect for a nostalgic sci-fi movie soundtrack",
@@ -52,14 +52,14 @@ VARIATIONS = {
         'flowstep': 0.13,
         'steps': 25
     },
-    
+
     # Band Arrangements
     'rock_band': {
         'prompt': "Full rock band arrangement with electric guitars, bass, and drums, perfect for an action movie trailer",
         'flowstep': 0.13,
         'steps': 25
     },
-    
+
     # Hybrid/Special
     'cinematic_epic': {
         'prompt': "Epic orchestral arrangement with modern hybrid elements, synthesizers, and percussion, perfect for movie trailers",
@@ -73,6 +73,34 @@ VARIATIONS = {
     },
     'synth_bass': {
         'prompt': "Deep analog synthesizer bassline with modern production and subtle modulation, perfect for electronic music production",
+        'flowstep': 0.12,
+        'steps': 25
+    },
+
+    'retro_rpg': {
+        'prompt': "16-bit era JRPG soundtrack with bright melodic synthesizers, orchestral elements, and adventurous themes, perfect for a fantasy video game battle scene or overworld exploration",
+        'flowstep': 0.13,
+        'steps': 25
+    },
+
+    'steel_drums': {
+        'prompt': "Vibrant Caribbean steel drum ensemble with tropical percussion and uplifting melodies, perfect for a beach resort commercial or travel documentary",
+        'flowstep': 0.13,
+        'steps': 25
+    },
+    'chiptune': {
+        'prompt': "8-bit video game soundtrack with arpeggiated melodies and classic NES-style square waves, perfect for a retro platformer or action game",
+        'flowstep': 0.13,
+        'steps': 25
+    },
+    'gamelan_fusion': {
+        'prompt': "Indonesian gamelan ensemble with metallic percussion, gongs, and ethereal textures, perfect for a meditation app or spiritual documentary",
+        'flowstep': 0.13,
+        'steps': 25
+    },
+
+    'music_box': {
+        'prompt': "Delicate music box melody with gentle bell tones and ethereal ambiance, perfect for a children's lullaby or magical fantasy scene",
         'flowstep': 0.12,
         'steps': 25
     }

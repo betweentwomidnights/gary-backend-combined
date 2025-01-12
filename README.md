@@ -19,6 +19,8 @@ melodyflow, aka terry, takes input audio and transforms it into audio the same l
 
 terry spins up on port 8002, but you only need your m4l device to continue talking to port 8000 (inside commentedout.js of https://github.com/betweentwomidnights/gary4live)
 
+# you will prolly need ~6gb of gpu ram to use terry locally.
+
 ## how to spin up the new docker-compose.yml
 
 1. install wsl and docker-desktop
@@ -43,6 +45,8 @@ cd ..
 docker-compose up -d
 docker-compose logs -f
 ```
+
+(note: depending on your install, the docker-compose commands may be 'docker compose' without the '-' )
 
 you should see the containers run after a few seconds of irrelevant warnings.
 

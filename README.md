@@ -3,6 +3,59 @@
 
 this repository serves as the backend for three applications: **gary-on-the-fly**, **gary4live**, and **gary4beatbox**. 
 
+# mega update - jan 12 2025
+
+we have a new model inside gary4live thanks to meta. it's in the /melodyflow folder.
+
+![terry in action](./terry_screenshot.png)
+
+we use the modified audiocraft repo at https://huggingface.co/spaces/facebook/melodyflow 
+
+since the official audiocraft repo hasn't been updated yet, we created a separate environment for the /transform endpoint. 
+
+melodyflow, aka terry, takes input audio and transforms it into audio the same length. you can now take your audio, transform it, continue it with gary, and then transform it again. you can also just return a gary output (up to ~40 secs), and transform it, then have gary continue it again.
+
+/melodyflow/variations.py has 'presets' inside it. those can be edited to whatever you want. we're still figuring out what works best but the ones we have so far are fun as hell.
+
+terry spins up on port 8002, but you only need your m4l device to continue talking to port 8000 (inside commentedout.js of https://github.com/betweentwomidnights/gary4live)
+
+## how to spin up the new docker-compose.yml
+
+1. install wsl and docker-desktop
+
+https://www.docker.com/products/docker-desktop/ (it's free)
+
+2. install docker-compose:
+```bash
+pip install docker-compose
+```
+(the exact way you get docker-compose installed isn't super important. there's a few different ways to do it)
+3. in the terminal:
+```bash
+wsl
+git clone https://github.com/betweentwomidnights/gary-backend-combined
+cd gary-backend-combined
+docker build -t thecollabagepatch/g4lwebsockets:latest -f Dockerfile.g4lwebsockets .
+docker build -t thecollabagepatch/redis:latest -f Dockerfile.redis .
+cd melodyflow
+docker build -t thecollabagepatch/melodyflow:latest -f Dockerfile.melodyflow .
+cd ..
+docker-compose up -d
+docker-compose logs -f
+```
+
+you should see the containers run after a few seconds of irrelevant warnings.
+
+done! if you have trouble installing docker-compose, just ask claude (lol).
+
+i'm going to work tonight to figure out how our apple silicon brothers can spin this up... i hope it's not too difficult.
+
+hit me up in the discord for any help https://discord.gg/VECkyXEnAd
+
+---
+
+# TODO - cleanup old readme below
+
 there's now a gary_docs folder. it's a mega-WIP.
 
 ### gary4live (g4lwebsockets)

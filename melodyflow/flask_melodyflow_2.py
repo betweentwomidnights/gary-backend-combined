@@ -303,6 +303,10 @@ def health_check():
         }), 503
 
 if __name__ == '__main__':
-    from waitress import serve
-    print("Starting MelodyFlow service in production mode...")
-    serve(app, host='0.0.0.0', port=8002, threads=4)
+    socketio.run(app, debug=False, host='0.0.0.0', port=8002)
+
+    # Production mode with gevent-websocket (uncomment for production)
+    # from gevent import pywsgi
+    # from geventwebsocket.handler import WebSocketHandler
+    # server = pywsgi.WSGIServer(('0.0.0.0', 8002), app, handler_class=WebSocketHandler)
+    # server.serve_forever()

@@ -714,7 +714,7 @@ def handle_transform_audio(data):
             flask_socket = None
             try:
                 # Create socket.io client instance
-                flask_socket = Client()
+                flask_socket = Client(reconnection=True, reconnection_attempts=5, reconnection_delay=1)
 
                 # Define progress handler with the wrapped emit
                 @flask_socket.on('progress')
@@ -726,7 +726,8 @@ def handle_transform_audio(data):
                         })
 
                 # Connect to Flask server's WebSocket
-                flask_socket.connect('http://melodyflow:8002', wait_timeout=10)
+                
+                flask_socket.connect('http://melodyflow:8002', wait_timeout=30)
                 # flask_socket.connect('http://10.0.0.5:8002', wait_timeout=10)
 
                 # Make the HTTP request for processing

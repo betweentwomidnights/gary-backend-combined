@@ -1,0 +1,59 @@
+# Use ARM64 Ubuntu 20.04 base image
+FROM --platform=linux/arm64 ubuntu:20.04
+
+# Set environment variable to prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set the working directory
+WORKDIR /usr/src/app
+
+# Install necessary system packages including Python build tools
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    python3.9 \
+    python3.9-distutils \
+    python3.9-dev \
+    build-essential \
+    gfortran \
+    wget \
+    git \
+    libatlas-base-dev \
+    libblas-dev \
+    liblapack-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pip for Python 3.9
+RUN wget https://bootstrap.pypa.io/get-pip.py && python3.9 get-pip.py && rm get-pip.py
+
+# Install setuptools and wheel
+RUN python3.9 -m pip install --upgrade pip setuptools wheel
+
+# Install numpy using a later version (or try with 1.24.0)
+RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
+
+# Copy the requirements file into the container
+COPY requirements-g4lwebsockets.txt ./requirements-g4lwebsockets.txt
+
+# Install Python dependencies from requirements-g4lwebsockets.txt
+RUN python3.9 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt
+RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
+
+# Verify gunicorn installation and list installed packages
+RUN python3.9 -m pip show gunicorn
+RUN python3.9 -m pip list
+
+# Copy the entire audiocraft folder (if applicable)
+COPY audiocraft /usr/src/app/audiocraft
+
+# Copy the current directory contents (excluding audiocraft which is already copied)
+COPY . .
+
+# Copy entrypoint.sh and make it executable
+COPY entrypoint.sh /usr/src/app/entrypoint.sh
+RUN chmod +x /usr/src/app/entrypoint.sh
+
+# Make port 8000 available to the world outside this container
+EXPOSE 8000
+
+# Use the entrypoint.sh script
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]

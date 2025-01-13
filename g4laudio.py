@@ -34,6 +34,15 @@ def resource_cleanup():
         torch.cuda.empty_cache()
         gc.collect()
 
+# Add this helper at the top of the file
+def get_device():
+    """Get the most appropriate device available."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
 def generate_session_id():
     """Generate a unique session ID."""
     return str(uuid.uuid4())
@@ -50,9 +59,10 @@ def rms_normalize(y, target_rms=0.05):
 
 def preprocess_audio(waveform):
     """Preprocess audio waveform."""
-    waveform_np = waveform.cpu().squeeze().numpy()  # Move tensor to CPU and convert to numpy
-    processed_waveform_np = waveform_np  # Use the waveform as-is without processing
-    return torch.from_numpy(processed_waveform_np).unsqueeze(0).cuda()  # Convert back to tensor and move to GPU
+    device = get_device()
+    waveform_np = waveform.cpu().squeeze().numpy()
+    processed_waveform_np = waveform_np
+    return torch.from_numpy(processed_waveform_np).unsqueeze(0).to(device)
 
 def wrap_audio_if_needed(waveform, sr, desired_duration):
     """Wrap audio if needed to match desired duration."""
@@ -76,6 +86,7 @@ def wrap_audio_if_needed(waveform, sr, desired_duration):
 
 def load_and_validate_audio(input_data_base64: str) -> tuple[torch.Tensor, int]:
     """Load and validate input audio from base64 string."""
+    device = get_device()
     input_audio = None
     try:
         input_data = base64.b64decode(input_data_base64)
@@ -83,7 +94,7 @@ def load_and_validate_audio(input_data_base64: str) -> tuple[torch.Tensor, int]:
         song, sr = torchaudio.load(input_audio)
         if song.size(0) == 0 or song.size(1) == 0:
             raise AudioProcessingError("Input audio is empty")
-        return song.cuda(), sr
+        return song.to(device), sr
     except Exception as e:
         raise AudioProcessingError(f"Failed to load audio: {str(e)}")
     finally:
@@ -109,8 +120,9 @@ def resample_for_model(audio: torch.Tensor, orig_sr: int, model_sr: int = 32000)
     if orig_sr == model_sr:
         return audio
     
+    device = get_device()
     with resource_cleanup():
-        resampler = T.Resample(orig_freq=orig_sr, new_freq=model_sr).cuda()
+        resampler = T.Resample(orig_freq=orig_sr, new_freq=model_sr).to(device)
         resampled = resampler(audio)
         return resampled
 
@@ -258,7 +270,7 @@ def _continue_music_impl(
                 output = output.repeat(original_minus_prompt.size(0), 1)
             
             # Combine audio using original sample rate
-            combined_waveform = torch.cat([original_minus_prompt, output], dim=1).cuda()
+            combined_waveform = torch.cat([original_minus_prompt, output], dim=1).to(get_device())
             
             # Save output with original sample rate
             return save_audio_to_base64(combined_waveform, sr)

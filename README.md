@@ -1,7 +1,6 @@
-
 # gary
 
-this repository serves as the backend for three applications: **gary-on-the-fly**, **gary4live**, and **gary4beatbox**. 
+This repository serves as the backend for three applications: **gary-on-the-fly**, **gary4live**, and **gary4beatbox**. 
 
 # mega update - jan 12 2025
 
@@ -22,6 +21,26 @@ terry spins up on port 8002, but you only need your m4l device to continue talki
 # you will prolly need ~6gb of gpu ram to use terry locally.
 
 ## how to spin up the new docker-compose.yml
+
+# This repo is a modified audiocraft repo that now attempts to use 'mps' as a device if you're on apple silicon. I'm just a p.c. boi so I haven't had the chance to test out the arm64 docker image yet.
+
+if you're on apple silicon, instead of 
+```bash
+docker build -t thecollabagepatch/g4lwebsockets:latest -f Dockerfile.g4lwebsockets . 
+```
+run
+```bash
+docker build -t thecollabagepatch/g4lwebsockets:latest -f Dockerfile.g4lwebsockets_arm64 . 
+```
+
+everything else should work the same. 
+
+please join the discord https://discord.gg/VECkyXEnAd and let me know how this goes on apple silicon. It's important to me that anyone can run our backend locally. 
+
+Note:
+- I edited `/audiocraft/encodec.py` and `/audiocraft/musicgen.py` to try and get 'mps' working for musicgen continuations.
+- `/melodyflow/audiocraft/models/melodyflow.py` apparently already has 'mps' as a possible device it can use. 
+- The mac front-end can be built using https://github.com/betweentwomidnights/gary-mac
 
 1. install wsl and docker-desktop
 
@@ -52,19 +71,15 @@ you should see the containers run after a few seconds of irrelevant warnings.
 
 done! if you have trouble installing docker-compose, just ask claude (lol).
 
-i'm going to work tonight to figure out how our apple silicon brothers can spin this up... i hope it's not too difficult.
-
-hit me up in the discord for any help https://discord.gg/VECkyXEnAd
+hit me up in the discord for any help 
 
 ---
 
 # TODO - cleanup old readme below
 
-there's now a gary_docs folder. it's a mega-WIP.
+the gary_docs folder has a bunch of random stuff in it that you can probably ignore.
 
 ### gary4live (g4lwebsockets)
-
-![gary4live](./gary4live%20screenshot.png)
 
 **gary4live** is a max for live device that enables musicgen continuations inside ableton. there's no text prompting here. instead, think of each fine-tune as a "preset" in the vst.
 
@@ -84,24 +99,9 @@ you'll need ableton live. you can use gary with the 30 day trial of ableton if y
 
 **gary4beatbox** is an ios app that uses the same backend as **gary4live** but also accepts raw json strings alongside the dicts used by **gary4live**. the backend ensures that the json strings are cleaned of backslashes before processing. the front-end repository is [here](https://github.com/betweentwomidnights/gary-4-steve).
 
+if our backend goes down, it's totally doable to use this docker-compose with zrok or ngrok and to input the backend url in your settings inside gary4beatbox. 
+
 ![gary4beatbox](./g4b.gif)
-
-## installation
-
-1. **install docker and docker compose**
-   - follow the instructions on the [docker website](https://docs.docker.com/get-docker/) to install docker.
-   - follow the instructions on the [docker compose website](https://docs.docker.com/compose/install/) to install docker compose.
-
-2. **clone this repository**
-
-   ```sh
-   git clone https://github.com/betweentwomidnights/gary-backend-combined.git
-   cd gary-backend-combined
-   mv docker-compose-g4lwebsockets.yml docker-compose.yml
-   sudo docker build -t thecollabagepatch/g4lwebsockets:latest -f dockerfile.g4lwebsockets .
-   sudo docker build -t thecollabagepatch/redis:latest -f dockerfile.redis .
-   sudo docker-compose up
-   ```
 
 ### gary-on-the-fly and gary4web (concurrent_gary)
 
@@ -113,7 +113,7 @@ this backend (`dockerfile.concurrent_gary`) is for the browser extension known a
 
 the front-end for gary-on-the-fly is [here](https://github.com/betweentwomidnights/gotf-frontend.git).
 
-there's also a web app at https://thecollabagepatch.com (go to gary's page and click gary4web). i still need to push the web app front-end to github. gary4web uses the `concurrent_gary` setup.
+there's also a web app at https://thecollabagepatch.com (go to gary's page and click gary4web. it is currently offline due to compute resources). i still need to push the web app front-end to github. gary4web uses the `concurrent_gary` setup.
 
   ```sh
   mv docker-compose-concurrent_gary.yml docker-compose.yml
@@ -130,6 +130,10 @@ there's also a web app at https://thecollabagepatch.com (go to gary's page and c
 a third backend exists for a multi-gpu setup that uses both docker images. it's in the `old_random_backup_scripts` folder.
 
 any fine-tunes hosted on huggingface can be used in both backends.
+
+fun fact: https://twitter.com/@thepatch_gary uses the `concurrent_gary` docker-compose to perform youtube continuations inside twitter. i run gary-andreessen locally. it accepts a @ (mention) with a youtube url + timestamp on twitter and returns an audiovisual continuation that you can THEN reply to him with the word 'continue' and have him pick up where he left off.
+
+https://github.com/betweentwomidnights/gary-andreessen (this is an absurd side project that uses a local llama to scrape clips of marc andreessen talking on youtube and 'continue' them as insane jungle drums with automated audio visual glitch fx and formulated tweet text. he's kinda stupid and still being born)
 
 ### train-gary
 

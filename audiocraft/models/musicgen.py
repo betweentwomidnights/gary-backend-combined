@@ -67,9 +67,12 @@ class MusicGen(BaseGenModel):
         - facebook/musicgen-style (1.5 B), text and style to music,
           # see: https://huggingface.co/facebook/musicgen-style
         """
+        # HERE KEV TRIES TO ADD MPS
         if device is None:
             if torch.cuda.device_count():
                 device = 'cuda'
+            elif torch.backends.mps.is_available():
+                device = 'mps'
             else:
                 device = 'cpu'
 

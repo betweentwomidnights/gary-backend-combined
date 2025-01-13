@@ -219,7 +219,9 @@ class EncodecModel(CompressionModel):
         q_res.x = self.postprocess(out, scale)
 
         return q_res
-
+    
+    
+    # HERE WE TRY TO USE MPS...THIS IS KEVS ADDITION
     def encode(self, x: torch.Tensor) -> tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]:
         """Encode the given input tensor to quantized representation along with scale parameter.
 
@@ -233,7 +235,14 @@ class EncodecModel(CompressionModel):
         """
         assert x.dim() == 3
         x, scale = self.preprocess(x)
-        emb = self.encoder(x)
+        
+        # Handle MPS device for encoder
+        if x.device.type == 'mps':
+            # Since mps-encoder does not work, cpu-encoder is used instead
+            emb = self.encoder.to('cpu')(x.to('cpu')).to('mps')
+        else:
+            emb = self.encoder(x)
+        
         codes = self.quantizer.encode(emb)
         return codes, scale
 
@@ -249,13 +258,20 @@ class EncodecModel(CompressionModel):
             out (torch.Tensor): Float tensor of shape [B, C, T], the reconstructed audio.
         """
         emb = self.decode_latent(codes)
-        out = self.decoder(emb)
+        
+        # Handle MPS device for decoder
+        if emb.device.type == 'mps':
+            # Similar to encoder, use CPU fallback for decoder operations
+            out = self.decoder.to('cpu')(emb.to('cpu')).to('mps')
+        else:
+            out = self.decoder(emb)
+        
         out = self.postprocess(out, scale)
-        # out contains extra padding added by the encoder and decoder
         return out
 
     def decode_latent(self, codes: torch.Tensor):
         """Decode from the discrete codes to continuous latent space."""
+        # The quantizer decode is simpler and should work on any device
         return self.quantizer.decode(codes)
 
 

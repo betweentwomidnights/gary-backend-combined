@@ -22,7 +22,7 @@ terry spins up on port 8002, but you only need your m4l device to continue talki
 
 ## how to spin up the new docker-compose.yml
 
-# This repo is a modified audiocraft repo that now attempts to use 'mps' as a device if you're on apple silicon. I'm just a p.c. boi so I haven't had the chance to test out the arm64 docker image yet.
+### This repo is a modified audiocraft repo that now attempts to use 'mps' as a device if you're on apple silicon. I'm just a p.c. boi so I haven't had the chance to test out the arm64 docker image yet.
 
 if you're on apple silicon, instead of 
 ```bash

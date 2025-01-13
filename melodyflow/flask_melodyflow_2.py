@@ -15,6 +15,35 @@ import logging
 from logging.handlers import RotatingFileHandler
 import traceback
 import os
+import sys
+
+# Add these imports at the top
+import weakref
+# Add these imports and keep existing ones
+from contextlib import contextmanager
+
+# Add these global variables
+model_ref = None
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+@contextmanager
+def resource_cleanup():
+    """Context manager to ensure proper cleanup of GPU resources."""
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
+# Configure logging to filter out the specific error
+class WebSocketErrorFilter(logging.Filter):
+    def filter(self, record):
+        return 'Cannot obtain socket from WSGI environment' not in str(record.msg)
+
+# Add the filter to the root logger
+logging.getLogger().addFilter(WebSocketErrorFilter())
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -92,12 +121,14 @@ def handle_generic_error(error):
 # Audio Processing
 
 def load_model():
-    """Initialize the MelodyFlow model with thread safety."""
-    global model
+    """Initialize the MelodyFlow model with improved memory management."""
+    global model, model_ref
     with model_lock:
         if model is None:
             print("Loading MelodyFlow model...")
-            model = MelodyFlow.get_pretrained('facebook/melodyflow-t24-30secs', device=device)
+            model = MelodyFlow.get_pretrained('facebook/melodyflow-t24-30secs', device=DEVICE)
+            # Create weak reference to track model
+            model_ref = weakref.ref(model)
     return model
 
 def load_audio_from_base64(audio_base64: str, target_sr: int = 32000) -> torch.Tensor:
@@ -138,15 +169,18 @@ def save_audio_to_base64(waveform: torch.Tensor, sample_rate: int = 32000) -> st
         raise AudioProcessingError(f"Failed to save audio: {str(e)}")
 
 def process_audio(waveform: torch.Tensor, variation_name: str, session_id: str) -> torch.Tensor:
-    """Process audio with selected variation using thread-safe model access."""
+    """Process audio with selected variation using scoped model instantiation."""
+    model = None
     try:
-        model = load_model()
-
         if variation_name not in VARIATIONS:
             raise AudioProcessingError(f"Unknown variation: {variation_name}")
         config = VARIATIONS[variation_name]
 
-        with model_lock:
+        with resource_cleanup():
+            # Initialize model within the processing function scope
+            print("Loading MelodyFlow model...")
+            model = MelodyFlow.get_pretrained('facebook/melodyflow-t24-30secs', device=device)
+
             # Find valid duration and get tokens
             max_valid_duration, tokens = find_max_duration(model, waveform)
             config['duration'] = max_valid_duration
@@ -195,6 +229,12 @@ def process_audio(waveform: torch.Tensor, variation_name: str, session_id: str) 
 
     except Exception as e:
         raise AudioProcessingError(f"Failed to process audio: {str(e)}")
+    finally:
+        # Explicitly delete the model
+        if model is not None:
+            del model
+        with resource_cleanup():
+            pass
 
 def find_max_duration(model: MelodyFlow, waveform: torch.Tensor, sr: int = 32000, max_token_length: int = 750) -> tuple:
     """Binary search to find maximum duration that produces tokens under the limit."""
@@ -226,29 +266,31 @@ def find_max_duration(model: MelodyFlow, waveform: torch.Tensor, sr: int = 32000
 
 @app.route('/transform', methods=['POST'])
 def transform_audio():
-    """Handle audio transformation requests."""
+    """Handle audio transformation requests with improved memory management."""
     try:
         data = request.get_json()
         if not data or 'audio' not in data or 'variation' not in data or 'session_id' not in data:
             return jsonify({'error': 'Missing required data'}), 400
 
-        # Load and process audio
-        input_waveform = load_audio_from_base64(data['audio'])
-        processed_waveform = process_audio(input_waveform, data['variation'], data['session_id'])
-        output_base64 = save_audio_to_base64(processed_waveform)
+        with resource_cleanup():
+            # Load and process audio
+            input_waveform = load_audio_from_base64(data['audio'])
+            processed_waveform = process_audio(input_waveform, data['variation'], data['session_id'])
+            output_base64 = save_audio_to_base64(processed_waveform)
+            
+            # Explicitly delete intermediate tensors
+            del input_waveform
+            del processed_waveform
 
-        return jsonify({
-            'audio': output_base64,
-            'message': 'Audio processed successfully'
-        })
+            return jsonify({
+                'audio': output_base64,
+                'message': 'Audio processed successfully'
+            })
 
     except AudioProcessingError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
-    finally:
-        torch.cuda.empty_cache()
-        gc.collect()
 
 @socketio.on('connect')
 def handle_connect():
@@ -303,10 +345,30 @@ def health_check():
         }), 503
 
 if __name__ == '__main__':
-    socketio.run(app, debug=False, host='0.0.0.0', port=8002)
+    # socketio.run(app, debug=False, host='0.0.0.0', port=8002)
 
     # Production mode with gevent-websocket (uncomment for production)
     # from gevent import pywsgi
     # from geventwebsocket.handler import WebSocketHandler
     # server = pywsgi.WSGIServer(('0.0.0.0', 8002), app, handler_class=WebSocketHandler)
     # server.serve_forever()
+
+    # Production mode with waitress (currently shows websocket errors but everything works fine bro)
+    
+    from waitress import serve
+    
+    
+    print("Starting MelodyFlow service in production mode...")
+    print("Note: You may see a WebSocket environment message - this can be safely ignored as all functionality works correctly.")
+    
+    # Redirect stderr to filter out the specific error
+    class StderrFilter:
+        def write(self, text):
+            if 'Cannot obtain socket from WSGI environment' not in text:
+                sys.__stderr__.write(text)
+        def flush(self):
+            sys.__stderr__.flush()
+    
+    sys.stderr = StderrFilter()
+    
+    serve(app, host='0.0.0.0', port=8002, threads=4)

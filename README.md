@@ -85,19 +85,13 @@ the gary_docs folder has a bunch of random stuff in it that you can probably ign
 
 #### backend for gary4live
 
-we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets.yml` file.
+we have servers running to host the backend, but if you're chad enough and want one all to yourself, the backend for running **gary4live** on its own is defined in the `docker-compose-g4lwebsockets.yml` file. this will spin up the docker-compose without terry.
 
 just rename this file to `docker-compose.yml` in order to run it. you can rename the existing `docker-compose.yml` to something else for now.
 
-install docker and docker-compose in your environment.
+**gary4beatbox** is an ios/android app that uses the same backend as **gary4live** 
 
-the front-end repository for **gary4live** can be found [here](https://github.com/betweentwomidnights/gary4live). 
-
-there is an installer for mac and pc. or you can build the electron ui yourself using that repository.
-
-you'll need ableton live. you can use gary with the 30 day trial of ableton if you want.
-
-**gary4beatbox** is an ios app that uses the same backend as **gary4live** but also accepts raw json strings alongside the dicts used by **gary4live**. the backend ensures that the json strings are cleaned of backslashes before processing. the front-end repository is [here](https://github.com/betweentwomidnights/gary-4-steve).
+https://apps.apple.com/us/app/gary4beatbox/id6736522400
 
 if our backend goes down, it's totally doable to use this docker-compose with zrok or ngrok and to input the backend url in your settings inside gary4beatbox. 
 

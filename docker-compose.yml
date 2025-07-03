@@ -9,6 +9,11 @@ services:
       - "8000:8000"
     environment:
       - ENV_VARIABLE=value
+      - HF_HOME=/app/.cache/huggingface
+      - TORCH_HOME=/app/.cache/torch
+    volumes:
+      - ./cache/g4lwebsockets:/app/.cache
+      - audio-transfer:/tmp/audio_transfer  # NEW: Shared volume for audio files
     depends_on:
       - redis
       - mongo
@@ -21,10 +26,23 @@ services:
               count: all
               capabilities: [gpu]
 
+  gpu-queue:
+    image: thecollabagepatch/go:dual
+    ports:
+      - "8085:8085"
+    depends_on:
+      - redis
+      - mongo
+    networks:
+      default: {}
+
   melodyflow:
     image: thecollabagepatch/melodyflow:latest
     ports:
       - "8002:8002"
+    volumes:
+      - ./cache/melodyflow:/app/.cache
+      - audio-transfer:/tmp/audio_transfer  # NEW: Same shared volume
     deploy:
       resources:
         reservations:
@@ -38,21 +56,58 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+  
+  stable-audio:
+    image: thecollabagepatch/stable-gary:latest
+    ports:
+      - "8005:8005"
+    environment:
+          - HF_TOKEN=${HF_TOKEN}
+          - HF_HOME=/app/.cache/huggingface
+    volumes:
+      - ./cache/stable-audio:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s      
 
   redis:
-    image: thecollabagepatch/redis:latest
+    image: thecollabagepatch/redis:optimized
     build:
       context: .
-      dockerfile: Dockerfile.redis
+      dockerfile: Dockerfile.redis-optimized
     ports:
       - "6379:6379"
 
   mongo:
-    image: "mongo:latest"
+    image: thecollabagepatch/mongo:latest
     ports:
       - "27017:27017"
     volumes:
-      - mongo-data:/data/db
+      - mongo-data-new:/data/db
+      - mongo-logs:/var/log/mongodb
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
+# Define volumes at the root level
 volumes:
-  mongo-data:
+  mongo-data-new:
+  mongo-logs:
+  audio-transfer:  # NEW: Shared volume for temporary audio files

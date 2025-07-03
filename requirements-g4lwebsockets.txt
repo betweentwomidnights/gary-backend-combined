@@ -1,14 +1,14 @@
 flask
-flask-socketio
+flask-socketio==5.3.0
+python-socketio==5.8.0
 websocket-client
-gevent
+gevent==22.10.2
 pymongo
 redis
 pydantic
 torchaudio
 torch==2.1.0
 audiocraft
-
 gunicorn
 gevent-websocket
 flask_cors

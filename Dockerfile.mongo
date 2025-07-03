@@ -1,0 +1,20 @@
+FROM mongo:4.4
+
+# Copy custom configuration file
+COPY mongodb.conf /etc/mongod.conf
+
+# Create log directory
+RUN mkdir -p /var/log/mongodb && \
+    chown -R mongodb:mongodb /var/log/mongodb
+
+# Copy initialization script
+COPY mongo-init.js /docker-entrypoint-initdb.d/
+
+# Set environment variables for performance
+ENV MONGO_WIREDTIGER_CACHE_SIZE_GB=1
+ENV MONGO_OPLOG_SIZE_MB=256
+
+# IMPORTANT: Do not override the default entrypoint
+# The official mongo image has a special entrypoint script that handles initialization
+# Just provide the config as an argument to mongod
+CMD ["--config", "/etc/mongod.conf"]

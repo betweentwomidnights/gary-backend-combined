@@ -1,0 +1,11 @@
+# Dockerfile.redis-optimized
+FROM redis:6.2
+
+# Create config directory
+RUN mkdir -p /usr/local/etc/redis
+
+# Copy configuration
+COPY redis.conf /usr/local/etc/redis/
+
+# Run with our config
+CMD ["redis-server", "/usr/local/etc/redis/redis.conf"]

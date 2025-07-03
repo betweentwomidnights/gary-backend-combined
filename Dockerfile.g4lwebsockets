@@ -4,6 +4,13 @@ FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu20.04
 # Set environment variable to prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Set HuggingFace cache environment variables
+ENV HF_HOME=/app/.cache/huggingface
+# ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
+ENV HF_DATASETS_CACHE=/app/.cache/huggingface
+ENV TORCH_HOME=/app/.cache/torch
+ENV XDG_CACHE_HOME=/app/.cache
+
 # Set the working directory
 WORKDIR /usr/src/app
 
@@ -35,7 +42,7 @@ RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
 COPY requirements-g4lwebsockets.txt ./requirements-g4lwebsockets.txt
 
 # Install Python dependencies from requirements-g4lwebsockets.txt
-RUN python3.9 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt
+RUN python3.9 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt psutil
 
 RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
 
@@ -47,7 +54,12 @@ RUN python3.9 -m pip list
 COPY audiocraft /usr/src/app/audiocraft
 
 # Copy the current directory contents (excluding audiocraft which is already copied)
-COPY . .
+# COPY . .
+
+# Copy only the specific Python files we need
+COPY g4lwebsockets.py /usr/src/app/
+COPY g4laudio.py /usr/src/app/
+COPY utils.py /usr/src/app/
 
 # Copy entrypoint.sh and make it executable
 COPY entrypoint.sh /usr/src/app/entrypoint.sh

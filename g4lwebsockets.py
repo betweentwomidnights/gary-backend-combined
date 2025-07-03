@@ -1,6 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
+import flask
 from flask import Flask, jsonify, request, copy_current_request_context
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from socketio import Client  # Add this import at the top with other imports
@@ -11,7 +12,7 @@ import base64
 import redis
 from g4laudio import process_audio, continue_music, generate_session_id
 from bson.objectid import ObjectId
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 import torch
 from flask_cors import CORS  # Import CORS
 import json
@@ -19,6 +20,129 @@ import json
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 import requests
+
+
+import gc
+from contextlib import contextmanager
+
+import os
+import signal
+from weakref import WeakSet
+import psutil
+import time
+from collections import defaultdict
+import threading
+from utils import parse_client_data
+
+import uuid
+
+class ThreadManager:
+    """Manages active processing threads and ensures cleanup."""
+    def __init__(self):
+        self.active_threads = WeakSet()
+        
+    def register_thread(self, greenlet):
+        """Register a new thread for tracking."""
+        self.active_threads.add(greenlet)
+        
+    def cleanup_threads(self):
+        """Cleanup completed threads and their resources."""
+        for thread in list(self.active_threads):
+            if thread.dead:
+                self.active_threads.remove(thread)
+
+# Create a global thread manager
+thread_manager = ThreadManager()
+
+class ProcessTracker:
+    """Tracks processes created during audio processing."""
+    def __init__(self):
+        self.start_pids = set()
+        self.current_pid = None
+    
+    def snapshot_processes(self):
+        """Take a snapshot of current Python processes."""
+        python_processes = set()
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if 'python' in proc.info['name'].lower():
+                    python_processes.add(proc.info['pid'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return python_processes
+    
+    def start_tracking(self):
+        """Start tracking processes."""
+        self.start_pids = self.snapshot_processes()
+        self.current_pid = os.getpid()
+    
+    def cleanup_new_processes(self):
+        """Cleanup processes that weren't present when tracking started."""
+        current_pids = self.snapshot_processes()
+        new_pids = current_pids - self.start_pids
+        
+        for pid in new_pids:
+            if pid != self.current_pid:  # Don't kill our own process
+                try:
+                    proc = psutil.Process(pid)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                except psutil.NoSuchProcess:
+                    continue
+
+@contextmanager
+def track_processes():
+    """Context manager for process tracking."""
+    tracker = ProcessTracker()
+    tracker.start_tracking()
+    try:
+        yield
+    finally:
+        tracker.cleanup_new_processes()
+        clean_gpu_memory()
+
+def enhanced_spawn(func):
+    """Wrapper for gevent.spawn that ensures proper cleanup."""
+    thread = gevent.spawn(func)
+    thread_manager.register_thread(thread)
+    return thread
+
+@contextmanager
+def force_gpu_cleanup():
+    """Enhanced GPU cleanup context manager."""
+    try:
+        yield
+    finally:
+        # Force release of all GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Synchronize all CUDA devices
+            torch.cuda.synchronize()
+        # Force garbage collection
+        gc.collect()
+
+def clean_gpu_memory():
+    """Utility function to force GPU memory cleanup."""
+    if torch.cuda.is_available():
+        # Empty the cache first
+        torch.cuda.empty_cache()
+        
+        # Get all active GPU devices
+        devices = range(torch.cuda.device_count())
+        for device in devices:
+            with torch.cuda.device(device):
+                # Synchronize the device to ensure all operations are complete
+                torch.cuda.synchronize()
+                # Empty the cache again after sync
+                torch.cuda.empty_cache()
+    
+    # Force garbage collection multiple times
+    for _ in range(3):
+        gc.collect()
+
 # MongoDB setup
 # THIS IS THE LOCAL VERSION
 # client = MongoClient('mongodb://localhost:27017/')
@@ -45,7 +169,8 @@ socketio = SocketIO(
     engineio_logger=True,
     ping_timeout=240,  # Use snake_case
     ping_interval=120,  # Use snake_case
-    max_http_buffer_size=64*1024*1024
+    max_http_buffer_size=64*1024*1024,
+    ping_timeout_callback=lambda: clean_gpu_memory()  # Add cleanup on ping timeout
 )
 
 @app.route('/')
@@ -72,20 +197,380 @@ class SessionRequest(BaseModel):
     description: Optional[str] = None  # New optional field
 
 class ContinueMusicRequest(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None  # Make this optional
     model_name: Optional[str] = None
     prompt_duration: Optional[int] = None
     audio_data: Optional[str] = None
     top_k: Optional[int] = None
     temperature: Optional[float] = None
     cfg_coef: Optional[float] = None
-    description: Optional[str] = None  # New optional field
+    description: Optional[str] = None
 
 class TransformRequest(BaseModel):
     """Pydantic model for transform requests."""
     audio_data: Optional[str] = None  # Optional because we might get it from session
     variation: str
     session_id: Optional[str] = None
+    flowstep: Optional[float] = Field(None, ge=0)  # Must be greater than or equal to 0 if provided
+    solver: Optional[str] = None  # Optional solver parameter
+    custom_prompt: Optional[str] = None  # New optional custom prompt parameter
+
+# Global throttle manager to limit progress update frequency
+class ThrottleManager:
+    """Manages throttling of frequent events like progress updates."""
+    
+    def __init__(self):
+        self.last_emit_time = defaultdict(float)
+        self.min_interval = 1.0  # Minimum seconds between progress updates per session
+        self.high_load_interval = 2.0  # Longer interval during high system load
+        self.lock = threading.Lock()
+        
+    def should_emit(self, session_id, event_type, force=False):
+        """Determines if an event should be emitted based on throttling rules."""
+        now = time.time()
+        key = f"{session_id}:{event_type}"
+        
+        with self.lock:
+            # Priority events are never throttled
+            if force or event_type in ['queue_status', 'audio_processed', 'music_continued', 'error']:
+                self.last_emit_time[key] = now
+                return True
+            
+            # Get active tasks count for adaptive throttling
+            active_tasks = self._count_active_tasks()
+            
+            # Determine throttle interval based on system load
+            throttle_interval = self.high_load_interval if active_tasks > 1 else self.min_interval
+            
+            # Check if enough time has passed since last emission
+            last_time = self.last_emit_time.get(key, 0)
+            if now - last_time >= throttle_interval:
+                self.last_emit_time[key] = now
+                return True
+                
+            return False
+    
+    def _count_active_tasks(self):
+        """Count active generation tasks using Redis."""
+        count = 0
+        try:
+            for key in redis_client.scan_iter("*_generation_in_progress"):
+                value = redis_client.get(key)
+                if value and value.decode('utf-8') == 'True':
+                    count += 1
+        except Exception:
+            # Default to 1 if we can't determine
+            return 1
+        return max(count, 1)  # Ensure at least 1
+
+# Create global instance
+throttle_manager = ThrottleManager()
+
+# 2. Create an enhanced emit function that applies throttling
+def smart_emit(event, data, room=None, namespace=None, force=False):
+    """
+    Smarter emit function that applies throttling rules and handles errors gracefully.
+    
+    Args:
+        event: The Socket.io event name
+        data: The data to emit
+        room: The Socket.io room to emit to (optional)
+        namespace: The Socket.io namespace (optional)
+        force: Whether to bypass throttling (for critical messages)
+    """
+    session_id = data.get('session_id', room) if isinstance(data, dict) else room
+    
+    # For events without a session_id or room, emit directly
+    if not session_id:
+        try:
+            socketio.emit(event, data, room=room, namespace=namespace)
+        except Exception as e:
+            print(f"[SOCKET] Error emitting {event}: {e}")
+        return
+    
+    # Apply throttling logic
+    if not throttle_manager.should_emit(session_id, event, force=force):
+        # If throttled, store the event for possible later delivery if it's important
+        if event in ['queue_status']:
+            # Store in Redis for the worker to pick up
+            notification_id = f"{session_id}_{int(time.time())}"
+            redis_key = f"throttled_event:{notification_id}"
+            event_data = {
+                'event': event,
+                'data': json.dumps(data),
+                'room': session_id,
+                'created_at': str(time.time()),
+                'throttled': 'true'
+            }
+            try:
+                redis_client.hmset(redis_key, event_data)
+                redis_client.expire(redis_key, 30)  # Short expiration
+                print(f"[THROTTLE] {event} for {session_id} throttled and stored for later delivery")
+            except Exception as e:
+                print(f"[THROTTLE] Error storing throttled event: {e}")
+                
+        return
+    
+    # Add priority metadata for queue_status messages
+    if event == 'queue_status' and isinstance(data, dict):
+        if 'priority' not in data:
+            data['priority'] = True
+    
+    # Emit the event
+    try:
+        socketio.emit(event, data, room=room, namespace=namespace)
+        if event != 'progress_update':  # Don't log progress updates to reduce noise
+            print(f"[SOCKET] Emitted {event} to {session_id}")
+    except Exception as e:
+        print(f"[SOCKET] Error emitting {event} to {session_id}: {e}")
+        
+        # If this was an important event, store for retry by worker
+        if event in ['queue_status', 'audio_processed', 'music_continued', 'error']:
+            notification_id = f"{session_id}_{int(time.time())}"
+            redis_key = f"failed_event:{notification_id}"
+            event_data = {
+                'event': event,
+                'data': json.dumps(data) if isinstance(data, dict) else str(data),
+                'room': session_id,
+                'created_at': str(time.time()),
+                'error': str(e)
+            }
+            try:
+                redis_client.hmset(redis_key, event_data)
+                redis_client.expire(redis_key, 3600)  # 1 hour expiration
+            except Exception as redis_err:
+                print(f"[SOCKET] Error storing failed event: {redis_err}")
+
+class NotificationWorker:
+    """
+    Dedicated worker for handling queue notifications without blocking the main process.
+    """
+    def __init__(self, socketio_instance, redis_client_instance):
+        self.socketio = socketio_instance
+        self.redis_client = redis_client_instance
+        self.worker_greenlet = None
+        self.running = False
+    
+    def start(self):
+        """Start the notification worker thread."""
+        if self.worker_greenlet is None or self.worker_greenlet.dead:
+            self.running = True
+            self.worker_greenlet = gevent.spawn(self._worker_loop)
+            print("[WORKER] Notification worker started")
+        return self.worker_greenlet
+    
+    def stop(self):
+        """Stop the notification worker thread."""
+        self.running = False
+        if self.worker_greenlet and not self.worker_greenlet.dead:
+            gevent.kill(self.worker_greenlet)
+            print("[WORKER] Notification worker stopped")
+    
+    def _process_failed_events(self):
+        """Process events that failed to emit."""
+        failed_keys = list(self.redis_client.scan_iter("failed_event:*"))
+        for key in failed_keys[:5]:  # Process up to 5 per cycle
+            try:
+                key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+                data = self.redis_client.hgetall(key_str)
+                if not data:
+                    continue
+                    
+                # Get event data
+                event = data.get(b'event', b'').decode('utf-8')
+                event_data_json = data.get(b'data', b'{}').decode('utf-8')
+                room = data.get(b'room', b'').decode('utf-8')
+                
+                if not event or not room:
+                    self.redis_client.delete(key_str)
+                    continue
+                    
+                try:
+                    event_data = json.loads(event_data_json)
+                except:
+                    event_data = event_data_json
+                    
+                # Try to emit the event
+                try:
+                    self.socketio.emit(event, event_data, room=room, namespace='/')
+                    print(f"[WORKER] Successfully re-emitted failed {event} to {room}")
+                    self.redis_client.delete(key_str)
+                except Exception as e:
+                    print(f"[WORKER] Failed to re-emit {event} to {room}: {e}")
+                    # Update retry count
+                    retry_count = int(data.get(b'retry_count', b'0').decode('utf-8')) + 1
+                    if retry_count >= 5:
+                        self.redis_client.delete(key_str)
+                    else:
+                        self.redis_client.hset(key_str, 'retry_count', str(retry_count))
+            except Exception as e:
+                print(f"[WORKER] Error processing failed event {key}: {e}")
+
+    def _process_throttled_events(self):
+        """Process events that were throttled."""
+        throttled_keys = list(self.redis_client.scan_iter("throttled_event:*"))
+        for key in throttled_keys[:5]:  # Process up to 5 per cycle
+            try:
+                key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+                data = self.redis_client.hgetall(key_str)
+                if not data:
+                    continue
+                    
+                # Get event data
+                event = data.get(b'event', b'').decode('utf-8')
+                event_data_json = data.get(b'data', b'{}').decode('utf-8')
+                room = data.get(b'room', b'').decode('utf-8')
+                
+                if not event or not room:
+                    self.redis_client.delete(key_str)
+                    continue
+                    
+                try:
+                    event_data = json.loads(event_data_json)
+                except:
+                    event_data = event_data_json
+                    
+                # Try to emit the event
+                try:
+                    self.socketio.emit(event, event_data, room=room, namespace='/')
+                    print(f"[WORKER] Successfully emitted throttled {event} to {room}")
+                    self.redis_client.delete(key_str)
+                except Exception as e:
+                    print(f"[WORKER] Failed to emit throttled {event} to {room}: {e}")
+            except Exception as e:
+                print(f"[WORKER] Error processing throttled event {key}: {e}")
+    
+    def _worker_loop(self):
+        """Main worker loop that processes pending notifications."""
+        while self.running:
+            try:
+                # First process any failed events (higher priority)
+                self._process_failed_events()
+                
+                # Process throttled events if system load is low enough
+                active_tasks = throttle_manager._count_active_tasks()
+                if active_tasks <= 1:
+                    self._process_throttled_events()
+                
+                # Process normal notifications (original code)
+                pending_keys = list(self.redis_client.scan_iter("task_notification:*"))
+                
+                for key in pending_keys:
+                    try:
+                        key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+                        
+                        # Get notification data
+                        notification_data = self.redis_client.hgetall(key_str)
+                        if not notification_data:
+                            continue
+                            
+                        # Check if it's been processed
+                        processed = notification_data.get(b'processed', b'false').decode('utf-8')
+                        if processed == 'true':
+                            # Already processed, skip
+                            continue
+                            
+                        # Check if it's been processed by worker
+                        worker_processed = notification_data.get(b'worker_processed', b'false').decode('utf-8')
+                        if worker_processed == 'true':
+                            # Already attempted by worker, skip to avoid duplicate attempts
+                            continue
+                            
+                        # Check if it's a recent notification (within 30 seconds)
+                        received_at = float(notification_data.get(b'received_at', b'0').decode('utf-8'))
+                        if time.time() - received_at > 30:
+                            # Old notification, mark as expired
+                            self.redis_client.hset(key_str, 'worker_processed', 'expired')
+                            continue
+                        
+                        # Extract session_id from the key
+                        # Format: task_notification:{session_id}_{timestamp}
+                        parts = key_str.split(':')
+                        if len(parts) < 2:
+                            continue
+                            
+                        session_parts = parts[1].split('_')
+                        if len(session_parts) < 2:
+                            continue
+                            
+                        session_id = session_parts[0]
+                        
+                        # Mark as being processed by worker
+                        self.redis_client.hset(key_str, 'worker_processed', 'true')
+                        self.redis_client.hset(key_str, 'worker_started_at', str(time.time()))
+                        
+                        # Get JSON data
+                        data_json = notification_data.get(b'data', b'{}').decode('utf-8')
+                        
+                        # Process notification
+                        try:
+                            data = json.loads(data_json)
+                            status = data.get('status')
+                            queue_status = data.get('queue_status', {})
+                            
+                            print(f"[WORKER] Processing notification for {session_id}: {status}")
+                            
+                            # Ensure queue_status has the status info
+                            if isinstance(queue_status, dict):
+                                queue_status['status'] = status
+                            
+                            # Generate status message
+                            status_message = get_queue_status_message({'queue_status': queue_status})
+                            status_message['session_id'] = session_id
+                            status_message['notification_id'] = parts[1]
+                            status_message['from_worker'] = True
+                            
+                            # Use socket event with force=True to bypass throttling for queue status messages
+                            smart_emit('queue_status', status_message, room=session_id, force=True)
+                            
+                            # Mark success
+                            self.redis_client.hset(key_str, 'worker_success', 'true')
+                            self.redis_client.hset(key_str, 'processed', 'true')
+                            print(f"[WORKER] Successfully emitted queue_status to {session_id}")
+                            
+                        except Exception as e:
+                            print(f"[WORKER] Error processing notification {key_str}: {e}")
+                            self.redis_client.hset(key_str, 'worker_error', str(e))
+                            self.redis_client.hset(key_str, 'worker_success', 'false')
+                            
+                    except Exception as e:
+                        print(f"[WORKER] Error handling notification key {key}: {e}")
+                
+                # Sleep to prevent CPU hogging
+                gevent.sleep(0.2)  # Shorter sleep for better responsiveness
+                
+            except Exception as e:
+                print(f"[WORKER] Error in notification worker loop: {e}")
+                gevent.sleep(1)  # Longer sleep on error
+
+
+
+# Initialization code to add to your main.py after socketio setup:
+def initialize_workers():
+    """Initialize and start background workers."""
+    global notification_worker
+    
+    # Create the notification worker
+    notification_worker = NotificationWorker(socketio, redis_client)
+    notification_worker.start()
+    
+    # Log worker initialization
+    print("[INIT] Started background workers")
+    
+    return notification_worker
+
+# Add this to your shutdown/cleanup logic to ensure workers are stopped
+def cleanup_workers():
+    """Stop all background workers."""
+    if 'notification_worker' in globals() and notification_worker:
+        notification_worker.stop()
+        print("[CLEANUP] Notification worker stopped")
+
+# This should be initialized after your socketio setup
+notification_worker = None
+
+# After creating socketio:
+notification_worker = initialize_workers()
 
 
 def store_audio_in_gridfs(data, filename):
@@ -131,9 +616,143 @@ def set_generation_in_progress(session_id, in_progress):
     """Set or unset the generation_in_progress flag in Redis."""
     redis_client.set(f"{session_id}_generation_in_progress", str(in_progress))
 
-def is_generation_in_progress(session_id):
-    """Check if generation is in progress using Redis."""
-    return redis_client.get(f"{session_id}_generation_in_progress") == b'True'
+def format_time_estimate(seconds):
+    """Convert seconds to a human-readable format"""
+    if seconds < 60:
+        return f"about {int(seconds)} seconds"
+    minutes = int(seconds / 60)
+    remaining_seconds = int(seconds % 60)
+    if remaining_seconds == 0:
+        return f"about {minutes} minute{'s' if minutes != 1 else ''}"
+    return f"about {minutes} minute{'s' if minutes != 1 else ''} and {remaining_seconds} seconds"
+
+def get_queue_status_message(queue_response):
+    """Generate a user-friendly queue status message with simplified time estimates"""
+    status = queue_response.get('queue_status', {})
+    if not status and isinstance(queue_response, dict):
+        status = queue_response
+        
+    print(f"Processing status data: {status}")  # Debug log
+    
+    estimated_wait = float(status.get('estimated_wait_seconds', 30.0))
+    active_tasks = int(status.get('active_tasks', 0))
+    queued_tasks = int(status.get('queued_tasks', 0))
+    task_status = status.get('status', '')
+    
+    print(f"Parsed metrics - Wait: {estimated_wait}s, Active: {active_tasks}, " 
+          f"Queued: {queued_tasks}, Status: {task_status}")  # Debug log
+
+    if task_status == 'ready':
+        message = "Starting generation now..."
+    elif task_status == 'queued':
+        message = (f"Task queued successfully. You are number {queued_tasks} in the queue. "
+                  f"Estimated wait time: {format_time_estimate(estimated_wait)}.")
+    else:
+        message = "Request received, determining queue status..."
+
+    return {
+        "message": message,
+        "position": queued_tasks,
+        "total_queued": queued_tasks + active_tasks,
+        "estimated_time": format_time_estimate(estimated_wait),
+        "estimated_seconds": estimated_wait,
+        "status": task_status
+    }
+
+def queue_task(session_id: str, task_type: str, task_data: dict) -> dict:
+    """Queue a task with the Go service and return the response"""
+    try:
+        task_payload = {
+            'session_id': session_id,
+            'task_type': task_type,
+            'data': json.dumps({
+                'model_name': task_data.get('model_name'),
+                'prompt_duration': task_data.get('prompt_duration'),
+                'top_k': task_data.get('top_k', 250),
+                'temperature': task_data.get('temperature', 1.0),
+                'cfg_coef': task_data.get('cfg_coef', 3.0),
+                'description': task_data.get('description'),
+            })
+        }
+
+        print(f"Sending task to queue service: {session_id}")
+        response = requests.post(
+            'http://gpu-queue:8085/tasks',
+            json=task_payload,
+            headers={'Content-Type': 'application/json'}
+        )
+        response.raise_for_status()
+        
+        response_data = response.json()
+        print(f"Queue response for {session_id}: {response_data}")  # Debug log
+        return response_data
+    except requests.exceptions.RequestException as e:
+        print(f"Error queuing task: {e}")
+        return None
+
+def is_generation_in_progress(session_id: str) -> bool:
+    """Modified to check with Go queue service"""
+    try:
+        response = requests.get(f'http://gpu-queue:8085/tasks/{session_id}')
+        if response.status_code == 200:
+            task_status = response.json()
+            return task_status.get('status') in ['processing', 'queued']
+        return False
+    except Exception as e:
+        print(f"Error checking task status: {e}")
+        return False
+
+def queue_transform_task(session_id: str, task_type: str, task_data: dict) -> dict:
+    """Queue a transform task with the Go service and return the response"""
+    try:
+        task_payload = {
+            'session_id': session_id,
+            'task_type': task_type,
+            'data': json.dumps(task_data)
+        }
+
+        print(f"Sending transform task to queue service: {session_id}")
+        response = requests.post(
+            'http://gpu-queue:8085/transform/tasks',
+            json=task_payload,
+            headers={'Content-Type': 'application/json'}
+        )
+        response.raise_for_status()
+        
+        response_data = response.json()
+        print(f"Transform queue response for {session_id}: {response_data}")
+        return response_data
+    except requests.exceptions.RequestException as e:
+        print(f"Error queuing transform task: {e}")
+        return None
+
+def is_transform_in_progress(session_id: str) -> bool:
+    """Check if a transform is in progress for the given session"""
+    try:
+        # First check Redis flag (faster than HTTP request)
+        redis_value = redis_client.get(f"{session_id}_transform_in_progress")
+        if redis_value and redis_value.decode('utf-8') == 'True':
+            return True
+            
+        # Then check with Go queue service
+        response = requests.get(f'http://gpu-queue:8085/transform/tasks/{session_id}')
+        if response.status_code == 200:
+            task_status = response.json()
+            return task_status.get('status') in ['processing', 'queued']
+        return False
+    except Exception as e:
+        print(f"Error checking transform task status: {e}")
+        return False
+
+def set_transform_in_progress(session_id, in_progress):
+    """Set or unset the transform_in_progress flag in Redis."""
+    redis_client.set(f"{session_id}_transform_in_progress", str(in_progress))
+    redis_client.expire(f"{session_id}_transform_in_progress", 3600)  # 1 hour expiration
+
+def store_transform_task_data(session_id, task_data):
+    """Store transform task data in Redis."""
+    redis_client.set(f"transform_task:{session_id}:data", json.dumps(task_data))
+    redis_client.expire(f"transform_task:{session_id}:data", 3600)  # 1 hour expiration
 
 @socketio.on('cleanup_session_request')
 def handle_cleanup_request(data):
@@ -141,244 +760,595 @@ def handle_cleanup_request(data):
         request_data = SessionRequest(**data)
         session_id = request_data.session_id
         if session_id:
-            sessions.delete_one({'_id': session_id})
-            leave_room(session_id)
-            redis_client.delete(f"{session_id}_generation_in_progress")
-            emit('cleanup_complete', {'message': 'Session cleaned up', 'session_id': session_id}, room=session_id)
+            with track_processes():  # Track and clean up processes
+                with force_gpu_cleanup():
+                    # Clean up Redis
+                    redis_client.delete(f"{session_id}_generation_in_progress")
+                    
+                    # Clear any chunked data
+                    chunk_pattern = f"{session_id}_chunk_*"
+                    for key in redis_client.scan_iter(chunk_pattern):
+                        redis_client.delete(key)
+                    redis_client.delete(f"{session_id}_received_chunks_set")
+                    
+                    # Leave the socket room
+                    leave_room(session_id)
+                    
+                    # Force GPU memory cleanup
+                    clean_gpu_memory()
+                    
+                    # Note: We're keeping the MongoDB session data for restore capabilities
+                    # but we ensure all GPU resources are freed
+                    
+                    # Clean up any remaining threads
+                    thread_manager.cleanup_threads()
+                    
+                    emit('cleanup_complete', {
+                        'message': 'Session cleaned up, GPU memory freed, and processes terminated',
+                        'session_id': session_id
+                    }, room=session_id)
+                    
     except ValidationError as e:
         emit('error', {'message': str(e), 'session_id': data.get('session_id')})
+    finally:
+        # One final cleanup pass
+        clean_gpu_memory()
+        thread_manager.cleanup_threads()
+
+def retry_socket_emit(event, data, room, max_attempts=5, base_delay=0.1):
+    """
+    Robust socket.io event emission with exponential backoff and guaranteed delivery.
+    """
+    attempt = 0
+    last_error = None
+    
+    # Create a unique message ID for tracking this emission
+    message_id = f"{room}_{int(time.time())}_{event}_{hash(str(data))}"
+    redis_tracking_key = f"socket_emit_tracking:{message_id}"
+    
+    # Store attempt information in Redis for monitoring and diagnostics
+    # USE HMSET INSTEAD OF SETEX to ensure we're using a hash consistently
+    initial_data = {
+        'event': event,
+        'room': room,
+        'attempts': '0',
+        'status': 'pending',
+        'created_at': str(time.time())
+    }
+    redis_client.hmset(redis_tracking_key, initial_data)
+    redis_client.expire(redis_tracking_key, 3600)  # Set expiration separately
+    
+    print(f"[SOCKET] Attempting to emit {event} to room {room} (tracking ID: {message_id})")
+    
+    while attempt < max_attempts:
+        try:
+            # Track current attempt - now correctly using a hash
+            redis_client.hset(redis_tracking_key, 'attempts', str(attempt + 1))
+            
+            # Force-join the room again to ensure connection
+            if hasattr(flask.request, 'sid'):
+                try:
+                    join_room(room)
+                    print(f"[SOCKET] Re-joined room {room} for guaranteed delivery")
+                except Exception as room_err:
+                    print(f"[SOCKET] Could not re-join room {room}: {room_err}")
+            
+            # Ensure the socketio event has a tracking ID
+            if isinstance(data, dict):
+                data['_tracking_id'] = message_id
+            
+            # Emit with acknowledgment callback if possible
+            socketio.emit(event, data, room=room, callback=lambda ack: 
+                redis_client.hset(redis_tracking_key, 'ack_received', 'true') 
+                if ack else None)
+            
+            print(f"[SOCKET] Successfully emitted {event} to {room} (attempt {attempt+1}/{max_attempts})")
+            redis_client.hset(redis_tracking_key, 'status', 'success')
+            return True
+            
+        except Exception as e:
+            last_error = e
+            attempt += 1
+            delay = base_delay * (2 ** attempt)  # Exponential backoff
+            
+            print(f"[SOCKET] Error emitting {event} to {room}, attempt {attempt}/{max_attempts}: {e}")
+            redis_client.hset(redis_tracking_key, 'last_error', str(e))
+            
+            # Don't retry immediately - allow other operations to proceed
+            time.sleep(delay)
+    
+    error_msg = f"Failed to emit {event} after {max_attempts} attempts: {last_error}"
+    print(f"[SOCKET ERROR] {error_msg}")
+    redis_client.hset(redis_tracking_key, 'status', 'failed')
+    redis_client.hset(redis_tracking_key, 'error', error_msg)
+    
+    return False
+
+@app.route('/task_notification', methods=['POST'])
+def handle_task_notification():
+    """
+    Handle task notifications from the Go queue service with improved reliability.
+    This implementation minimizes blocking during active tasks.
+    """
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'status': 'error', 'message': 'No JSON data received'}), 400
+            
+        session_id = data.get('session_id')
+        if not session_id:
+            return jsonify({'status': 'error', 'message': 'Missing session_id'}), 400
+            
+        status = data.get('status')
+        task_type = data.get('type')
+        
+        # Get notification ID from headers if available or generate a new one
+        notification_id = request.headers.get('X-Notification-ID', f"{session_id}_{int(time.time())}")
+        redis_key = f"task_notification:{notification_id}"
+        
+        # Store notification in Redis immediately
+        notification_data = {
+            'data': json.dumps(data),
+            'received_at': str(time.time()),
+            'processed': 'false',
+            'worker_processed': 'false',
+            'headers': json.dumps(dict(request.headers)),
+            'urgent': 'true' if status == 'ready' else 'false'
+        }
+        
+        redis_client.hmset(redis_key, notification_data)
+        redis_client.expire(redis_key, 3600)  # 1 hour expiration
+        
+        print(f"[QUEUE] Stored notification {notification_id} for {session_id} with status {status}")
+        
+        # For 'ready' status, start task processing right away
+        if status == 'ready':
+            redis_client.hset(redis_key, 'processing_started', 'true')
+            
+            # Launch the appropriate task handler in a background job
+            if task_type == 'process_audio':
+                thread = enhanced_spawn(lambda: handle_task_ready(session_id))
+                print(f"[QUEUE] Started handle_task_ready for session {session_id}")
+            elif task_type == 'continue_music':
+                thread = enhanced_spawn(lambda: handle_task_ready_continue(session_id))
+                print(f"[QUEUE] Started handle_task_ready_continue for session {session_id}")
+            elif task_type == 'retry_music':
+                thread = enhanced_spawn(lambda: handle_task_ready_retry(session_id))
+                print(f"[QUEUE] Started handle_task_ready_retry for session {session_id}")
+            elif task_type == 'transform_audio':
+                thread = enhanced_spawn(lambda: handle_task_ready_transform(session_id))
+                print(f"[QUEUE] Started handle_task_ready_transform for session {session_id}")
+        
+        # Try immediate emit while we have request context
+        try:
+            queue_status = data.get('queue_status', {})
+            if isinstance(queue_status, dict):
+                queue_status['status'] = status
+            
+            # Generate the status message
+            status_message = get_queue_status_message({'queue_status': queue_status})
+            status_message['session_id'] = session_id
+            status_message['notification_id'] = notification_id
+            
+            # Since we are in a request context, we can emit directly
+            smart_emit('queue_status', status_message, room=session_id, force=True)
+            
+            # Mark as processed since we succeeded
+            redis_client.hset(redis_key, 'immediate_emit', 'true')
+            redis_client.hset(redis_key, 'processed', 'true')
+            
+            print(f"[QUEUE] Successfully emitted queue_status for {session_id} in request handler")
+            
+        except Exception as emit_error:
+            # Just log the error - the worker will handle it
+            print(f"[WARN] Initial emit failed, worker will retry: {emit_error}")
+            redis_client.hset(redis_key, 'immediate_emit_error', str(emit_error))
+        
+        # Return success response
+        return jsonify({
+            'status': 'received',
+            'notification_id': notification_id,
+            'message': 'Task notification received for processing'
+        })
+        
+    except Exception as e:
+        # Catch-all exception handler
+        error_id = f"error_{int(time.time())}"
+        print(f"[ERROR] {error_id} in handle_task_notification: {str(e)}")
+        
+        # Return error response
+        return jsonify({
+            'status': 'error',
+            'error_id': error_id,
+            'message': f'Exception processing task notification: {str(e)}'
+        }), 500
+
 
 @socketio.on('process_audio_request')
 def handle_audio_processing(data):
     try:
-        # Check if the received data is a string (raw JSON string from Swift)
-        if isinstance(data, str):
-            # Remove both single and double backslashes
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            # Parse the cleaned raw JSON string into a dictionary
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        # Basic cleanup
+        clean_gpu_memory()
+        thread_manager.cleanup_threads()
+        
+        # Parse and clean client data
+        try:
+            data = parse_client_data(data)
+        except ValueError as e:
+            emit('error', {'message': str(e)})
+            return
 
-        # Clean model_name and strip leading/trailing spaces
-        if "model_name" in data:
-            data["model_name"] = data["model_name"].replace("\\", "").strip()
-
-        # Clean optional parameters and strip leading/trailing spaces
-        for param in ['top_k', 'temperature', 'cfg_coef', 'description']:
-            if param in data and data[param] is not None:
-                data[param] = str(data[param]).replace("\\", "").strip()
-
-        # Proceed with the usual flow
+        # Validate request
         request_data = AudioRequest(**data)
         session_id = generate_session_id()
 
-        if is_generation_in_progress(session_id):
-            emit('error', {'message': 'Generation already in progress', 'session_id': session_id}, room=session_id)
-            return
+        # Add debug logging for MongoDB storage
+        mongo_data = {
+            '_id': session_id,  # Make sure we use same ID
+            'model_name': str(request_data.model_name),
+            'prompt_duration': int(request_data.prompt_duration),
+            'parameters': {  # Group optional parameters
+                'top_k': int(request_data.top_k) if request_data.top_k is not None else 250,
+                'temperature': float(request_data.temperature) if request_data.temperature is not None else 1.0,
+                'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0,
+            },
+            'description': request_data.description,
+            'created_at': datetime.now(timezone.utc)
+        }
+        
+        print(f"Storing session data for {session_id}: {mongo_data}")  # Debug log
+        
+        sessions.update_one(
+            {'_id': session_id},
+            {'$set': mongo_data},
+            upsert=True
+        )
 
+        # Store initial audio data
+        store_audio_data(session_id, request_data.audio_data, 'initial_audio')
+
+        # Join room first
         join_room(session_id)
 
-        # Emit the session ID immediately after generation and joining the room
+        # Verify room joining by setting a Redis flag using hash instead of string
+        room_key = f"room_joined:{session_id}"
+        redis_client.hmset(room_key, {'joined': 'true', 'timestamp': str(time.time())})
+        redis_client.expire(room_key, 3600)  # 1 hour expiration
+        
+        # Emit initial acknowledgment without queue status
         emit('process_audio_received', {'session_id': session_id})
         print(f"Emitted process_audio_received for session {session_id}")
 
-        input_data_base64 = request_data.audio_data
-        model_name = request_data.model_name
-        prompt_duration = request_data.prompt_duration
+        # Queue the task
+        queue_response = queue_task(session_id, 'process_audio', data)
+        if not queue_response:
+            emit('error', {'message': 'Failed to queue task', 'session_id': session_id})
+            return
 
-        # Extract optional parameters with default values if not provided
-        top_k = int(request_data.top_k) if request_data.top_k is not None else 250
-        temperature = float(request_data.temperature) if request_data.temperature is not None else 1.0
-        cfg_coef = float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0
-        description = request_data.description if request_data.description else None
-
-        # Log relevant information without base64 data
-        print(f"Received process_audio_request for session {session_id} with model_name: {model_name}, prompt_duration: {prompt_duration}")
-
-        store_audio_data(session_id, input_data_base64, 'initial_audio')
-        set_generation_in_progress(session_id, True)
-
-        @copy_current_request_context
-        def audio_processing_thread():
-            try:
-                def progress_callback(current, total):
-                    progress_percent = (current / total) * 100
-                    emit('progress_update', {'progress': int(progress_percent), 'session_id': session_id}, room=session_id)
-
-                # Call process_audio with new parameters
-                result_base64 = process_audio(
-                    input_data_base64,
-                    model_name,
-                    progress_callback,
-                    prompt_duration=prompt_duration,
-                    top_k=top_k,
-                    temperature=temperature,
-                    cfg_coef=cfg_coef,
-                    description=description
-                )
-                print(f"Audio processed successfully for session {session_id}")
-
-                store_audio_data(session_id, result_base64, 'last_processed_audio')
-                emit('audio_processed', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
-            except Exception as e:
-                print(f"Error during audio processing thread for session {session_id}: {e}")
-                emit('error', {'message': str(e), 'session_id': session_id})
-            finally:
-                set_generation_in_progress(session_id, False)
-
-        gevent.spawn(audio_processing_thread)
+        # We don't emit queue status here anymore - we'll let the task_notification handle it
 
     except ValidationError as e:
         emit('error', {'message': str(e), 'session_id': generate_session_id()})
+    finally:
+        thread_manager.cleanup_threads()
+
+def handle_task_ready(session_id):
+    try:
+        session_data = sessions.find_one({'_id': session_id})
+        print(f"Retrieved session data for {session_id}: {session_data}")
+        
+        if not session_data:
+            raise ValueError(f"No session data found for {session_id}")
+
+        # Verify required fields with types
+        model_name = str(session_data['model_name'])
+        prompt_duration = int(session_data['prompt_duration'])
+        parameters = session_data.get('parameters', {})
+        
+        # Get audio and verify
+        input_data_base64 = retrieve_audio_data(session_id, 'initial_audio')
+        if not input_data_base64:
+            raise ValueError(f"No audio data found for {session_id}")
+
+        # Mark as processing
+        set_generation_in_progress(session_id, True)
+
+         # Notify Go service that task is now processing
+        requests.post(
+            'http://gpu-queue:8085/task/status',
+            json={
+                'session_id': session_id,
+                'status': 'processing'
+            }
+        )
+
+        def audio_processing_thread():
+            try:
+                with track_processes():
+                    def progress_callback(current, total):
+                        progress_percent = (current / total) * 100
+                        smart_emit('progress_update',
+                            {'progress': int(progress_percent), 'session_id': session_id}, 
+                            room=session_id)
+
+                    # Use our verified parameters
+                    result_base64 = process_audio(
+                        input_data_base64,
+                        model_name,  # Use verified model_name
+                        progress_callback,
+                        prompt_duration=prompt_duration,  # Use verified prompt_duration
+                        top_k=parameters.get('top_k', 250),
+                        temperature=parameters.get('temperature', 1.0),
+                        cfg_coef=parameters.get('cfg_coef', 3.0),
+                        description=session_data.get('description')
+                    )
+                    
+                    store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    socketio.emit('audio_processed',
+                         {'audio_data': result_base64, 'session_id': session_id}, 
+                         room=session_id)
+
+                    # Notify Go service that task is complete
+                    requests.post(
+                        'http://gpu-queue:8085/task/status',
+                        json={
+                            'session_id': session_id,
+                            'status': 'completed'
+                        }
+                    )
+
+            except Exception as e:
+                print(f"Error during audio processing thread for session {session_id}: {e}")
+                socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                # Notify Go service of failure
+                requests.post(
+                    'http://gpu-queue:8085/task/status',
+                    json={
+                        'session_id': session_id,
+                        'status': 'failed'
+                    }
+                )
+            finally:
+                set_generation_in_progress(session_id, False)
+                clean_gpu_memory()
+                thread_manager.cleanup_threads()
+
+        enhanced_spawn(audio_processing_thread)
+
+    except Exception as e:
+        print(f"Error in handle_task_ready for session {session_id}: {e}")
+        socketio.emit('error', {
+            'message': str(e),
+            'session_id': session_id
+        }, room=session_id)
+        set_generation_in_progress(session_id, False)
 
 @socketio.on('continue_music_request')
 def handle_continue_music(data):
     try:
-        # Check if the received data is a string (raw JSON string from Swift)
-        if isinstance(data, str):
-            # Remove both single and double backslashes
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            # Parse the cleaned raw JSON string into a dictionary
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        clean_gpu_memory()
+        thread_manager.cleanup_threads()
+        
+        try:
+            data = parse_client_data(data)
+        except ValueError as e:
+            emit('error', {'message': str(e)})
+            return
 
-        # Clean model_name and strip leading/trailing spaces
-        if "model_name" in data:
-            data["model_name"] = data["model_name"].replace("\\", "").strip()
-
-        # Clean session_id
-        if "session_id" in data:
-            data["session_id"] = data["session_id"].replace("\\", "").strip()
-
-        # Clean optional parameters and strip leading/trailing spaces
-        for param in ['top_k', 'temperature', 'cfg_coef', 'description']:
-            if param in data and data[param] is not None:
-                data[param] = str(data[param]).replace("\\", "").strip()
-
-        # Proceed with the usual flow using the updated Pydantic model
         request_data = ContinueMusicRequest(**data)
         session_id = request_data.session_id
+
+        # NEW: Auto-create session if none exists and audio_data provided
+        if not session_id and request_data.audio_data:
+            session_id = generate_session_id()
+            print(f"Auto-creating session {session_id} for continue request")
+            
+            # Create minimal session with defaults (similar to crop logic)
+            mongo_data = {
+                '_id': session_id,
+                'model_name': request_data.model_name or 'thepatch/vanya_ai_dnb_0.1',
+                'prompt_duration': request_data.prompt_duration or 6,
+                'parameters': {
+                    'top_k': int(request_data.top_k) if request_data.top_k else 250,
+                    'temperature': float(request_data.temperature) if request_data.temperature else 1.0,
+                    'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef else 3.0,
+                },
+                'description': request_data.description,
+                'created_at': datetime.now(timezone.utc),
+                'created_from': 'jerry_continue'  # Flag to indicate origin
+            }
+            
+            sessions.update_one(
+                {'_id': session_id},
+                {'$set': mongo_data},
+                upsert=True
+            )
+            
+            # Store the audio data as last_processed_audio
+            store_audio_data(session_id, request_data.audio_data, 'last_processed_audio')
+            
+        elif not session_id:
+            # No session and no audio data - this is an error
+            emit('error', {'message': 'No session ID provided and no audio data to create session'})
+            return
 
         if is_generation_in_progress(session_id):
             emit('error', {'message': 'Generation already in progress', 'session_id': session_id}, room=session_id)
             return
 
-        emit('continue_music_received', {'session_id': session_id, 'message': 'Starting continuation'})
-        print(f"Emitted continue_music_received for session {session_id}")
-
-        # Use 'audio_data' from data if available, else retrieve from session
-        if request_data.audio_data:
-            input_data_base64 = request_data.audio_data
-            print(f"Using 'audio_data' from request for session {session_id}")
-        else:
-            input_data_base64 = retrieve_audio_data(session_id, 'last_processed_audio')
-            print(f"Retrieved 'last_processed_audio' from session {session_id}")
-
-        if input_data_base64 is None:
-            emit('error', {'message': 'No audio data available for continuation', 'session_id': session_id}, room=session_id)
-            return
-
-        # Extract optional parameters with default values if not provided
+        # Extract parameters for MongoDB storage
         top_k = int(request_data.top_k) if request_data.top_k is not None else 250
         temperature = float(request_data.temperature) if request_data.temperature is not None else 1.0
         cfg_coef = float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0
-        description = request_data.description if request_data.description else None
+        description = request_data.description
 
+        # Get or set model parameters
         model_name = request_data.model_name or sessions.find_one({'_id': session_id}).get('model_name')
         prompt_duration = request_data.prompt_duration or sessions.find_one({'_id': session_id}).get('prompt_duration')
 
-        print(f"Continuing music for session {session_id} with model_name: {model_name}, prompt_duration: {prompt_duration}")
+        # Update session data in MongoDB
+        mongo_data = {
+            'model_name': model_name,
+            'prompt_duration': prompt_duration,
+            'parameters': {
+                'top_k': top_k,
+                'temperature': temperature,
+                'cfg_coef': cfg_coef,
+            },
+            'description': description,
+            'updated_at': datetime.now(timezone.utc)
+        }
+        
+        sessions.update_one(
+            {'_id': session_id},
+            {'$set': mongo_data},
+            upsert=True
+        )
 
-        set_generation_in_progress(session_id, True)
+        # Store audio data if provided in request
+        if request_data.audio_data:
+            store_audio_data(session_id, request_data.audio_data, 'last_processed_audio')
 
-        @copy_current_request_context
-        def continue_music_thread():
-            try:
-                def progress_callback(current, total):
-                    progress_percent = (current / total) * 100
-                    emit('progress_update', {'progress': int(progress_percent), 'session_id': session_id}, room=session_id)
+        # Prepare task data
+        task_data = {
+            'model_name': model_name,
+            'prompt_duration': prompt_duration,
+            'top_k': top_k,
+            'temperature': temperature,
+            'cfg_coef': cfg_coef,
+            'description': description
+        }
+        
+        # Queue the task
+        queue_response = queue_task(session_id, 'continue_music', task_data)
+        if not queue_response:
+            emit('error', {'message': 'Failed to queue task', 'session_id': session_id})
+            return
 
-                result_base64 = continue_music(
-                    input_data_base64,
-                    model_name,
-                    progress_callback,
-                    prompt_duration=prompt_duration,
-                    top_k=top_k,
-                    temperature=temperature,
-                    cfg_coef=cfg_coef,
-                    description=description
-                )
+        # Join room for this session
+        join_room(session_id)
 
-                store_audio_data(session_id, input_data_base64, 'last_input_audio')
-                store_audio_data(session_id, result_base64, 'last_processed_audio')
+        # Emit queue status to client
+        # Emit queue status to client with time estimates
+        # queue_status = get_queue_status_message(queue_response)
+        # queue_status['session_id'] = session_id  # Add session_id to the response
+        # emit('queue_status', queue_status)
 
-                # Calculate the size of the base64 string in bytes
-                result_size_bytes = len(result_base64.encode('utf-8'))
+        # Emit continue music received confirmation
+        emit('continue_music_received', {'session_id': session_id})
+        print(f"Emitted continue_music_received for session {session_id}")
 
-                # Get the max_http_buffer_size (ensure it's consistent with your SocketIO configuration)
-                max_size_bytes = 64 * 1024 * 1024  # 64 MB
-
-                if result_size_bytes > max_size_bytes:
-                    emit('error', {
-                        'message': 'Generated audio data is too large to send.',
-                        'session_id': session_id,
-                        'code': 'DATA_TOO_LARGE'
-                    }, room=session_id)
-                    print(f"Generated audio data is too large for session {session_id}: {result_size_bytes} bytes.")
-                else:
-                    try:
-                        emit('music_continued', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
-                    except Exception as e:
-                        print(f"Error emitting music_continued for session {session_id}: {e}")
-                        emit('error', {
-                            'message': 'Error sending generated audio data.',
-                            'session_id': session_id,
-                            'code': 'EMIT_ERROR'
-                        }, room=session_id)
-            except Exception as e:
-                print(f"Error during continue_music_thread for session {session_id}: {e}")
-                emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
-            finally:
-                set_generation_in_progress(session_id, False)
-
-        gevent.spawn(continue_music_thread)
     except ValidationError as e:
         emit('error', {'message': str(e), 'session_id': data.get('session_id') if isinstance(data, dict) else None})
+    finally:
+        thread_manager.cleanup_threads()
+
+def handle_task_ready_continue(session_id):
+    try:
+        session_data = sessions.find_one({'_id': session_id})
+        print(f"Retrieved session data for continue music {session_id}: {session_data}")
+        
+        if not session_data:
+            raise ValueError(f"No session data found for {session_id}")
+
+        # Get audio data based on what was stored - either from request or last processed
+        input_data_base64 = retrieve_audio_data(session_id, 'last_processed_audio')
+        if not input_data_base64:
+            raise ValueError(f"No audio data found for {session_id}")
+
+        # Verify required fields with types
+        model_name = str(session_data['model_name'])
+        prompt_duration = int(session_data['prompt_duration'])
+        parameters = session_data.get('parameters', {})
+        
+        # Mark as processing
+        set_generation_in_progress(session_id, True)
+
+         # Notify Go service that task is now processing
+        requests.post(
+            'http://gpu-queue:8085/task/status',
+            json={
+                'session_id': session_id,
+                'status': 'processing'
+            }
+        )
+
+        def continue_music_processing_thread():
+            try:
+                with track_processes():
+                    def progress_callback(current, total):
+                        progress_percent = (current / total) * 100
+                        smart_emit('progress_update',
+                             {'progress': int(progress_percent), 'session_id': session_id}, 
+                             room=session_id)
+
+                    # Use verified parameters
+                    result_base64 = continue_music(
+                        input_data_base64,
+                        model_name,
+                        progress_callback,
+                        prompt_duration=prompt_duration,
+                        top_k=parameters.get('top_k', 250),
+                        temperature=parameters.get('temperature', 1.0),
+                        cfg_coef=parameters.get('cfg_coef', 3.0),
+                        description=session_data.get('description')
+                    )
+                    
+                    store_audio_data(session_id, input_data_base64, 'last_input_audio')
+                    store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    socketio.emit('music_continued',
+                         {'audio_data': result_base64, 'session_id': session_id}, 
+                         room=session_id)
+
+                    # Notify Go service that task is complete
+                    requests.post(
+                        'http://gpu-queue:8085/task/status',
+                        json={
+                            'session_id': session_id,
+                            'status': 'completed'
+                        }
+                    )
+
+            except Exception as e:
+                print(f"Error during continue music processing thread for session {session_id}: {e}")
+                socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                # Notify Go service of failure
+                requests.post(
+                    'http://gpu-queue:8085/task/status',
+                    json={
+                        'session_id': session_id,
+                        'status': 'failed'
+                    }
+                )
+            finally:
+                set_generation_in_progress(session_id, False)
+                clean_gpu_memory()
+                thread_manager.cleanup_threads()
+
+        enhanced_spawn(continue_music_processing_thread)
+
+    except Exception as e:
+        print(f"Error in handle_task_ready_continue for session {session_id}: {e}")
+        socketio.emit('error', {
+            'message': str(e),
+            'session_id': session_id
+        }, room=session_id)
+        set_generation_in_progress(session_id, False)
 
 @socketio.on('retry_music_request')
 def handle_retry_music(data):
     try:
-        # Check if the received data is a string (raw JSON string from Swift)
-        if isinstance(data, str):
-            # Remove both single and double backslashes
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            # Parse the cleaned raw JSON string into a dictionary
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        clean_gpu_memory()
+        thread_manager.cleanup_threads()
+        
+        # Handle string data (from Swift)
+        
+        try:
+            data = parse_client_data(data)
+        except ValueError as e:
+            emit('error', {'message': str(e)})
+            return
 
-        # Clean model_name and strip leading/trailing spaces
-        if "model_name" in data:
-            data["model_name"] = data["model_name"].replace("\\", "").strip()
-
-        # Clean session_id
-        if "session_id" in data:
-            data["session_id"] = data["session_id"].replace("\\", "").strip()
-
-        # Clean optional parameters and strip leading/trailing spaces
-        for param in ['top_k', 'temperature', 'cfg_coef', 'description']:
-            if param in data and data[param] is not None:
-                data[param] = str(data[param]).replace("\\", "").strip()
-
-        # Proceed with the usual flow using the updated data
         request_data = SessionRequest(**data)
         session_id = request_data.session_id
 
@@ -386,98 +1356,217 @@ def handle_retry_music(data):
             emit('error', {'message': 'Generation already in progress', 'session_id': session_id}, room=session_id)
             return
 
+        # Check for last input audio
         last_input_base64 = retrieve_audio_data(session_id, 'last_input_audio')
         if last_input_base64 is None:
             emit('error', {'message': 'No last input audio available for retry', 'session_id': session_id}, room=session_id)
             return
 
-        # Extract optional parameters with default values if not provided
+        # Extract parameters with default values
         top_k = int(request_data.top_k) if request_data.top_k is not None else 250
         temperature = float(request_data.temperature) if request_data.temperature is not None else 1.0
         cfg_coef = float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0
-        description = request_data.description if request_data.description else None
+        description = request_data.description
 
+        # Get model parameters from session if not provided
         model_name = request_data.model_name or sessions.find_one({'_id': session_id}).get('model_name')
         prompt_duration = request_data.prompt_duration or sessions.find_one({'_id': session_id}).get('prompt_duration')
 
-        print(f"Retrying music for session {session_id} with model_name: {model_name}, prompt_duration: {prompt_duration}")
-        emit('retry_music_received', {'session_id': session_id}, room=session_id)
+        # Update session data in MongoDB
+        mongo_data = {
+            'model_name': model_name,
+            'prompt_duration': prompt_duration,
+            'parameters': {
+                'top_k': top_k,
+                'temperature': temperature,
+                'cfg_coef': cfg_coef,
+            },
+            'description': description,
+            'updated_at': datetime.now(timezone.utc)
+        }
+        
+        sessions.update_one(
+            {'_id': session_id},
+            {'$set': mongo_data},
+            upsert=True
+        )
+
+        # Prepare task data for queue
+        task_data = {
+            'model_name': str(model_name),
+            'prompt_duration': int(prompt_duration),
+            'top_k': int(top_k),
+            'temperature': float(temperature),
+            'cfg_coef': float(cfg_coef),
+            'description': description if description else None
+        }
+        
+        # Remove None values
+        task_data = {k: v for k, v in task_data.items() if v is not None}
+        
+        # Queue the task
+        queue_response = queue_task(session_id, 'retry_music', task_data)
+        if not queue_response:
+            emit('error', {'message': 'Failed to queue task', 'session_id': session_id})
+            return
+
+        # Join room for this session
+        join_room(session_id)
+
+        # Emit queue status to client
+        # Emit queue status to client with time estimates
+        # queue_status = get_queue_status_message(queue_response)
+        # queue_status['session_id'] = session_id  # Add session_id to the response
+        # emit('queue_status', queue_status)
+
+        # Emit retry music received confirmation
+        emit('retry_music_received', {'session_id': session_id})
         print(f"Emitted retry_music_received for session {session_id}")
 
+    except ValidationError as e:
+        emit('error', {'message': str(e), 'session_id': data.get('session_id') if isinstance(data, dict) else None})
+    finally:
+        thread_manager.cleanup_threads()
 
+def handle_task_ready_retry(session_id):
+    try:
+        session_data = sessions.find_one({'_id': session_id})
+        print(f"Retrieved session data for retry music {session_id}: {session_data}")
+        
+        if not session_data:
+            raise ValueError(f"No session data found for {session_id}")
+
+        # Get the last input audio for retry
+        input_data_base64 = retrieve_audio_data(session_id, 'last_input_audio')
+        if not input_data_base64:
+            raise ValueError(f"No last input audio found for {session_id}")
+
+        # Verify required fields with types
+        model_name = str(session_data['model_name'])
+        prompt_duration = int(session_data['prompt_duration'])
+        parameters = session_data.get('parameters', {})
+        
+        # Mark as processing
         set_generation_in_progress(session_id, True)
 
-        @copy_current_request_context
-        def retry_music_thread():
-            try:
-                def progress_callback(current, total):
-                    progress_percent = (current / total) * 100
-                    emit('progress_update', {'progress': int(progress_percent), 'session_id': session_id}, room=session_id)
+         # Notify Go service that task is now processing
+        requests.post(
+            'http://gpu-queue:8085/task/status',
+            json={
+                'session_id': session_id,
+                'status': 'processing'
+            }
+        )
 
-                result_base64 = continue_music(
-                    last_input_base64,
-                    model_name,
-                    progress_callback,
-                    prompt_duration=prompt_duration,
-                    top_k=top_k,
-                    temperature=temperature,
-                    cfg_coef=cfg_coef,
-                    description=description
-                )
-                store_audio_data(session_id, last_input_base64, 'last_input_audio')
-                store_audio_data(session_id, result_base64, 'last_processed_audio')
-                emit('music_retried', {'audio_data': result_base64, 'session_id': session_id}, room=session_id)
+        def retry_music_processing_thread():
+            try:
+                with track_processes():
+                    def progress_callback(current, total):
+                        progress_percent = (current / total) * 100
+                        smart_emit('progress_update',
+                             {'progress': int(progress_percent), 'session_id': session_id}, 
+                             room=session_id)
+
+                    # Use verified parameters
+                    result_base64 = continue_music(
+                        input_data_base64,
+                        model_name,
+                        progress_callback,
+                        prompt_duration=prompt_duration,
+                        top_k=parameters.get('top_k', 250),
+                        temperature=parameters.get('temperature', 1.0),
+                        cfg_coef=parameters.get('cfg_coef', 3.0),
+                        description=session_data.get('description')
+                    )
+                    
+                    # Store the same input audio again for potential future retries
+                    store_audio_data(session_id, input_data_base64, 'last_input_audio')
+                    store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    socketio.emit('music_retried',
+                         {'audio_data': result_base64, 'session_id': session_id}, 
+                         room=session_id)
+
+                    # Notify Go service that task is complete
+                    requests.post(
+                        'http://gpu-queue:8085/task/status',
+                        json={
+                            'session_id': session_id,
+                            'status': 'completed'
+                        }
+                    )
+
             except Exception as e:
-                print(f"Error during retry_music_thread for session {session_id}: {e}")
-                emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                print(f"Error during retry music processing thread for session {session_id}: {e}")
+                socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                # Notify Go service of failure
+                requests.post(
+                    'http://gpu-queue:8085/task/status',
+                    json={
+                        'session_id': session_id,
+                        'status': 'failed'
+                    }
+                )
             finally:
                 set_generation_in_progress(session_id, False)
+                clean_gpu_memory()
+                thread_manager.cleanup_threads()
 
-        gevent.spawn(retry_music_thread)
-    except ValidationError as e:
-        session_id = data.get('session_id') if isinstance(data, dict) else None
-        emit('error', {'message': str(e), 'session_id': session_id})
+        enhanced_spawn(retry_music_processing_thread)
+
+    except Exception as e:
+        print(f"Error in handle_task_ready_retry for session {session_id}: {e}")
+        socketio.emit('error', {
+            'message': str(e),
+            'session_id': session_id
+        }, room=session_id)
+        set_generation_in_progress(session_id, False)
 
 @socketio.on('update_cropped_audio')
 def handle_update_cropped_audio(data):
     try:
-        if isinstance(data, str):
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
-
-        request_data = SessionRequest(**data)
-        session_id = request_data.session_id
+        data = parse_client_data(data)
+        
+        session_id = data.get('session_id')
         audio_data_base64 = data.get('audio_data')
 
-        if not session_id or not audio_data_base64:
-            raise ValueError("Missing session_id or audio_data")
+        if not audio_data_base64:
+            raise ValueError("Missing audio_data")
 
-        # Validate session exists
-        session = sessions.find_one({'_id': session_id})
-        if not session:
-            raise ValueError("Invalid session ID")
+        # NEW: If no session exists, create one automatically
+        if not session_id:
+            session_id = generate_session_id()
+            
+            # Create minimal session with sensible defaults
+            mongo_data = {
+                '_id': session_id,
+                'model_name': 'thepatch/vanya_ai_dnb_0.1',  # Default model
+                'prompt_duration': 6,  # Default duration
+                'parameters': {
+                    'top_k': 250,
+                    'temperature': 1.0,
+                    'cfg_coef': 3.0,
+                },
+                'description': None,
+                'created_at': datetime.now(timezone.utc),
+                'created_from': 'jerry_crop'  # Flag to indicate origin
+            }
+            
+            sessions.update_one(
+                {'_id': session_id},
+                {'$set': mongo_data},
+                upsert=True
+            )
+            
+            join_room(session_id)
+            print(f"Auto-created session {session_id} from Jerry crop")
 
-        # Check file size
-        data_size_bytes = len(audio_data_base64.encode('utf-8'))
-        max_size_bytes = 64 * 1024 * 1024  # 64 MB
-
-        if data_size_bytes > max_size_bytes:
-            emit('error', {
-                'message': 'Cropped audio data is too large',
-                'code': 'DATA_TOO_LARGE',
-                'session_id': session_id
-            }, room=session_id)
-            return
-
+        # Store cropped audio as last_processed_audio (ready for continue)
         store_audio_data(session_id, audio_data_base64, 'last_processed_audio')
+        
         emit('update_cropped_audio_complete', {
-            'message': 'Cropped audio updated',
+            'message': 'Cropped audio updated - ready to continue',
             'session_id': session_id,
-            'data_size': data_size_bytes
+            'auto_created': not data.get('session_id')  # Tell frontend if session was auto-created
         }, room=session_id)
 
         print(f"Cropped audio updated for session {session_id}")
@@ -490,13 +1579,8 @@ def handle_update_cropped_audio(data):
 @socketio.on('restore_processed_audio')
 def handle_restore_processed_audio(data):
     try:
-        if isinstance(data, str):
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        # Parse client data - any parsing errors will be caught by the outer try/except
+        data = parse_client_data(data)
 
         # Get the audio data size
         audio_data_base64 = data.get('audio_data')
@@ -570,13 +1654,8 @@ def handle_begin_restore(data):
 def handle_audio_chunk(data):
     try:
         # Handle string input just like restore_processed_audio
-        if isinstance(data, str):
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        # Parse client data - any parsing errors will be caught by the outer try/except
+        data = parse_client_data(data)
 
         session_id = data.get('session_id')
         chunk = data.get('chunk')
@@ -669,30 +1748,56 @@ def handle_audio_chunk(data):
         print(f"Error in handle_audio_chunk: {e}")
         emit('error', {'message': str(e)})
 
+# Add this utility function for file management TRANSFORM ENDPOINT
+def write_audio_to_temp_file(audio_base64, session_id):
+    """Write base64 audio data to a temporary file and return the path."""
+    try:
+        # Create unique filename
+        filename = f"input_{session_id}_{uuid.uuid4().hex[:8]}.wav"
+        file_path = f"/tmp/audio_transfer/{filename}"
+        
+        # Ensure directory exists
+        os.makedirs("/tmp/audio_transfer", exist_ok=True)
+        
+        # Decode and write binary data
+        audio_data = base64.b64decode(audio_base64)
+        with open(file_path, 'wb') as f:
+            f.write(audio_data)
+            
+        return file_path
+    except Exception as e:
+        print(f"Error writing audio to temp file: {e}")
+        return None
+
+def cleanup_temp_file(file_path):
+    """Safely remove a temporary file."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"Cleaned up temp file: {file_path}")
+    except Exception as e:
+        print(f"Error cleaning up temp file {file_path}: {e}")
+
 @socketio.on('transform_audio_request')
 def handle_transform_audio(data):
     try:
-        # Handle string input (from Swift)
-        if isinstance(data, str):
-            clean_data = data.replace("\\\\", "\\").replace("\\", "")
-            try:
-                data = json.loads(clean_data)
-            except json.JSONDecodeError as e:
-                emit('error', {'message': 'Invalid JSON format: ' + str(e)})
-                return
+        clean_gpu_memory()
+        thread_manager.cleanup_threads()
+        data = parse_client_data(data)
 
         request_data = TransformRequest(**data)
         session_id = request_data.session_id or generate_session_id()
 
-        if is_generation_in_progress(session_id):
-            emit('error', {'message': 'Generation already in progress', 'session_id': session_id}, room=session_id)
+        # Check if a transform is already in progress for this session
+        if is_transform_in_progress(session_id):
+            emit('error', {'message': 'Transform already in progress', 'session_id': session_id}, room=session_id)
             return
 
         join_room(session_id)
 
-        if not request_data.session_id:
-            emit('transform_audio_received', {'session_id': session_id})
-            print(f"Emitted transform_audio_received for new session {session_id}")
+        # Always emit this acknowledgment, regardless of whether it's a new or existing session
+        emit('transform_audio_received', {'session_id': session_id})
+        print(f"Emitted transform_audio_received for session {session_id}")
 
         # Get audio data
         if request_data.audio_data:
@@ -703,84 +1808,244 @@ def handle_transform_audio(data):
                 emit('error', {'message': 'No audio data available for transformation', 'session_id': session_id}, room=session_id)
                 return
 
-        set_generation_in_progress(session_id, True)
+        # Store the audio data for later use
+        store_audio_data(session_id, input_data_base64, 'transform_input_audio')
 
-        # Create a wrapped emit function that preserves the request context
-        @copy_current_request_context
-        def context_emit(event, data):
-            socketio.emit(event, data, room=session_id)
+        # Prepare transform task data
+        task_data = {
+            'variation': request_data.variation,
+            'session_id': session_id
+        }
+        
+        # Add optional parameters if they exist
+        if hasattr(request_data, 'flowstep') and request_data.flowstep is not None:
+            task_data['flowstep'] = request_data.flowstep
+        
+        if hasattr(request_data, 'solver') and request_data.solver is not None:
+            task_data['solver'] = request_data.solver.lower()
+        
+        # Add custom prompt if provided
+        if hasattr(request_data, 'custom_prompt') and request_data.custom_prompt is not None:
+            task_data['custom_prompt'] = request_data.custom_prompt
 
-        def transform_audio_thread():
-            flask_socket = None
-            try:
-                # Create socket.io client instance
-                flask_socket = Client(reconnection=True, reconnection_attempts=5, reconnection_delay=1)
+        # Store task data in Redis
+        store_transform_task_data(session_id, task_data)
 
-                # Define progress handler with the wrapped emit
-                @flask_socket.on('progress')
-                def handle_progress(data):
-                    if data['session_id'] == session_id:
-                        context_emit('progress_update', {
-                            'progress': data['progress'],
-                            'session_id': session_id
-                        })
+        # Queue the task with the Go service
+        queue_response = queue_transform_task(session_id, 'transform_audio', task_data)
+        if not queue_response:
+            emit('error', {'message': 'Failed to queue transform task', 'session_id': session_id}, room=session_id)
+            return
 
-                # Connect to Flask server's WebSocket
-                
-                flask_socket.connect('http://melodyflow:8002', wait_timeout=30)
-                # flask_socket.connect('http://10.0.0.5:8002', wait_timeout=10)
-
-                # Make the HTTP request for processing
-                response = requests.post(
-                    'http://melodyflow:8002/transform',
-                   # 'http://10.0.0.5:8002/transform',
-                    json={
-                        'audio': input_data_base64,
-                        'variation': request_data.variation,
-                        'session_id': session_id
-                    }
-                )
-
-                if response.status_code == 200:
-                    result = response.json()
-                    result_base64 = result['audio']
-
-                    # Store audio data
-                    store_audio_data(session_id, input_data_base64, 'last_input_audio')
-                    store_audio_data(session_id, result_base64, 'last_processed_audio')
-
-                    # Check size before sending
-                    result_size_bytes = len(result_base64.encode('utf-8'))
-                    max_size_bytes = 64 * 1024 * 1024
-
-                    if result_size_bytes > max_size_bytes:
-                        context_emit('error', {
-                            'message': 'Transformed audio data is too large to send.',
-                            'session_id': session_id,
-                            'code': 'DATA_TOO_LARGE'
-                        })
-                    else:
-                        context_emit('audio_transformed', {
-                            'audio_data': result_base64,
-                            'session_id': session_id,
-                            'variation': request_data.variation
-                        })
-                else:
-                    error_message = response.json().get('error', 'Unknown error during transformation')
-                    context_emit('error', {'message': error_message, 'session_id': session_id})
-
-            except Exception as e:
-                print(f"Error during transform_audio_thread for session {session_id}: {e}")
-                context_emit('error', {'message': str(e), 'session_id': session_id})
-            finally:
-                if flask_socket:
-                    flask_socket.disconnect()
-                set_generation_in_progress(session_id, False)
-
-        gevent.spawn(transform_audio_thread)
+        # Emit queue status to client
+        # queue_status = get_queue_status_message(queue_response)
+        # queue_status['session_id'] = session_id
+        # smart_emit('queue_status', queue_status, room=session_id)
 
     except ValidationError as e:
         emit('error', {'message': str(e), 'session_id': data.get('session_id') if isinstance(data, dict) else None})
+    finally:
+        thread_manager.cleanup_threads()
+
+
+# Modified handle_task_ready_transform function
+def handle_task_ready_transform(session_id):
+    try:
+        print(f"Starting transform task for session {session_id}")
+        
+        # Get the input audio data we stored earlier
+        input_data_base64 = retrieve_audio_data(session_id, 'transform_input_audio')
+        if not input_data_base64:
+            raise ValueError(f"No input audio found for transform session {session_id}")
+
+        # Write audio to temporary file instead of sending base64
+        temp_input_file = write_audio_to_temp_file(input_data_base64, session_id)
+        if not temp_input_file:
+            raise ValueError("Failed to write audio to temporary file")
+
+        # Get the transform parameters from Redis
+        task_data_json = redis_client.get(f"transform_task:{session_id}:data")
+        if not task_data_json:
+            cleanup_temp_file(temp_input_file)
+            raise ValueError(f"No task data found for transform session {session_id}")
+
+        task_data = json.loads(task_data_json.decode('utf-8'))
+        
+        # Set transform in progress in Redis
+        set_transform_in_progress(session_id, True)
+        
+        # Notify Go service that task is now processing
+        requests.post(
+            'http://gpu-queue:8085/transform/task/status',
+            json={
+                'session_id': session_id,
+                'status': 'processing'
+            }
+        )
+
+        def transform_audio_thread():
+            flask_socket = None
+            temp_output_file = None
+            try:
+                with track_processes():
+                    
+                    def context_emit(event, data):
+                        smart_emit(event, data, room=session_id)
+
+                    print(f"[DEBUG] Starting transform_audio_thread for session {session_id}")
+                    flask_socket = Client(reconnection=True, reconnection_attempts=5, reconnection_delay=1)
+
+                    @flask_socket.on('progress')
+                    def handle_progress(data):
+                        if data.get('session_id') == session_id:
+                            context_emit('progress_update', {
+                                'progress': data.get('progress', 0),
+                                'session_id': session_id
+                            })
+
+                    print(f"[DEBUG] Connecting to MelodyFlow WebSocket for session {session_id}")
+                    flask_socket.connect('http://melodyflow:8002', wait_timeout=30)
+                    print(f"[DEBUG] Connected to MelodyFlow WebSocket")
+
+                    # Prepare request payload with file path instead of base64
+                    request_payload = {
+                        'audio_file_path': temp_input_file,  # NEW: Send file path instead
+                        'variation': task_data.get('variation'),
+                        'session_id': session_id
+                    }
+
+                    # Add optional parameters if they exist
+                    if 'flowstep' in task_data and task_data['flowstep'] is not None:
+                        request_payload['flowstep'] = task_data['flowstep']
+                    
+                    if 'solver' in task_data and task_data['solver'] is not None:
+                        request_payload['solver'] = task_data['solver']
+
+                    # Add custom prompt if provided
+                    if 'custom_prompt' in task_data and task_data['custom_prompt'] is not None:
+                        request_payload['custom_prompt'] = task_data['custom_prompt']
+
+                    print(f"[DEBUG] Sending transform request to MelodyFlow for session {session_id}")
+                    response = requests.post(
+                        'http://melodyflow:8002/transform',
+                        json=request_payload
+                    )
+                    print(f"[DEBUG] Received transform response: status={response.status_code}")
+                    
+                    if response.status_code == 200:
+                        # Immediate result
+                        result = response.json()
+                        
+                        # Check if response contains file path or base64
+                        if 'audio_file_path' in result:
+                            # Read result from file
+                            temp_output_file = result['audio_file_path']
+                            with open(temp_output_file, 'rb') as f:
+                                audio_data = f.read()
+                            result_base64 = base64.b64encode(audio_data).decode('utf-8')
+                        else:
+                            # Backward compatibility - still accept base64 response
+                            result_base64 = result['audio']
+
+                        # Store audio data (keeping base64 for Redis storage)
+                        store_audio_data(session_id, input_data_base64, 'last_input_audio')
+                        store_audio_data(session_id, result_base64, 'last_processed_audio')
+
+                        # Check size before sending
+                        result_size_bytes = len(result_base64.encode('utf-8'))
+                        max_size_bytes = 128 * 1024 * 1024
+
+                        if result_size_bytes > max_size_bytes:
+                            smart_emit('error', {
+                                'message': 'Transformed audio data is too large to send.',
+                                'session_id': session_id,
+                                'code': 'DATA_TOO_LARGE'
+                            }, room=session_id)
+                        else:
+                            smart_emit('audio_transformed', {
+                                'audio_data': result_base64,
+                                'session_id': session_id,
+                                'variation': task_data.get('variation')
+                            }, room=session_id, force=True)
+                            
+                    elif response.status_code == 202:
+                        # Queued processing - let MelodyFlow handle it
+                        response_data = response.json()
+                        job_id = response_data.get('job_id')
+                        
+                        if not job_id:
+                            raise ValueError("No job_id in MelodyFlow response")
+                            
+                        print(f"[DEBUG] MelodyFlow job ID: {job_id} for session {session_id}")
+                        
+                    else:
+                        # Error occurred
+                        error_message = response.json().get('error', f'Unknown error during transformation (code: {response.status_code})')
+                        raise ValueError(error_message)
+
+                    # Notify Go service that task is complete
+                    requests.post(
+                        'http://gpu-queue:8085/transform/task/status',
+                        json={
+                            'session_id': session_id,
+                            'status': 'completed'
+                        }
+                    )
+
+            except Exception as e:
+                print(f"[DEBUG] Exception in transform_audio_thread for session {session_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                smart_emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                
+                # Notify Go service of failure
+                try:
+                    requests.post(
+                        'http://gpu-queue:8085/transform/task/status',
+                        json={
+                            'session_id': session_id,
+                            'status': 'failed'
+                        }
+                    )
+                except Exception as status_err:
+                    print(f"Error updating transform task status to failed: {status_err}")
+            finally:
+                print(f"[DEBUG] Cleaning up transform_audio_thread for session {session_id}")
+                if flask_socket and flask_socket.connected:
+                    flask_socket.disconnect()
+                
+                # Clean up temporary files
+                cleanup_temp_file(temp_input_file)
+                if temp_output_file:
+                    cleanup_temp_file(temp_output_file)
+                    
+                set_transform_in_progress(session_id, False)
+                clean_gpu_memory()
+                thread_manager.cleanup_threads()
+
+        enhanced_spawn(transform_audio_thread)
+
+    except Exception as e:
+        print(f"Error in handle_task_ready_transform for session {session_id}: {e}")
+        cleanup_temp_file(temp_input_file if 'temp_input_file' in locals() else None)
+        smart_emit('error', {
+            'message': str(e),
+            'session_id': session_id
+        }, room=session_id)
+        
+        # Update task status to failed in queue
+        try:
+            requests.post(
+                'http://gpu-queue:8085/transform/task/status',
+                json={
+                    'session_id': session_id,
+                    'status': 'failed'
+                }
+            )
+        except Exception as status_err:
+            print(f"Error updating transform task status to failed: {status_err}")
+            
+        set_transform_in_progress(session_id, False)
 
 @socketio.on('undo_transform_request')
 def handle_undo_transform(data):
@@ -896,14 +2161,79 @@ def get_latest_generated_audio(session_id):
 # Add a cleanup mechanism to remove old sessions
 @app.route('/api/cleanup_old_sessions', methods=['POST'])
 def cleanup_old_sessions():
-    threshold_time = datetime.now(timezone.utc) - timedelta(hours=24)
-    result = sessions.delete_many({
-        'created_at': {'$lt': threshold_time}
-    })
-    return jsonify({
-        'status': 'success',
-        'deleted_count': result.deleted_count
-    }), 200
+    cleanup_stats = {
+        "mongodb_sessions": 0,
+        "gridfs_files": 0,
+        "redis_keys": 0,
+        "errors": []
+    }
+    
+    try:
+        threshold_time = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        # 1. GridFS cleanup - one at a time
+        try:
+            cursor = fs.find({'uploadDate': {'$lt': threshold_time}})
+            for file_doc in cursor:
+                try:
+                    fs.delete(file_doc._id)
+                    cleanup_stats["gridfs_files"] += 1
+                    gevent.sleep(0.2)  # Longer delay between operations
+                except Exception as e:
+                    cleanup_stats["errors"].append(f"GridFS file deletion error: {str(e)}")
+        except Exception as e:
+            cleanup_stats["errors"].append(f"GridFS cursor error: {str(e)}")
+
+        # 2. MongoDB sessions cleanup - do this second since it's lighter
+        try:
+            result = sessions.delete_many({
+                'created_at': {'$lt': threshold_time}
+            })
+            cleanup_stats["mongodb_sessions"] = result.deleted_count
+        except Exception as e:
+            cleanup_stats["errors"].append(f"Session cleanup error: {str(e)}")
+        
+        # 3. Redis cleanup
+        redis_count = 0
+        try:
+            for key in redis_client.scan_iter("*_generation_in_progress"):
+                try:
+                    session_id = key.decode('utf-8').split('_')[0]
+                    if not sessions.find_one({'_id': session_id}):
+                        redis_client.delete(key)
+                        redis_client.delete(f"{session_id}_progress")
+                        redis_client.delete(f"{session_id}_received_chunks_set")
+                        # Clean up chunks
+                        for chunk_key in redis_client.scan_iter(f"{session_id}_chunk_*"):
+                            redis_client.delete(chunk_key)
+                        redis_count += 1
+                        if redis_count % 10 == 0:
+                            gevent.sleep(0.1)
+                except Exception as e:
+                    cleanup_stats["errors"].append(f"Redis key cleanup error: {str(e)}")
+        except Exception as e:
+            cleanup_stats["errors"].append(f"Redis cleanup error: {str(e)}")
+                
+        cleanup_stats["redis_keys"] = redis_count
+        
+        # Add memory stats
+        process = psutil.Process()
+        cleanup_stats["memory_before_gc"] = round(process.memory_info().rss / 1024 / 1024, 2)  # MB
+        gc.collect()
+        cleanup_stats["memory_after_gc"] = round(process.memory_info().rss / 1024 / 1024, 2)  # MB
+        
+        return jsonify({
+            "status": "success" if not cleanup_stats["errors"] else "partial_success",
+            "cleanup_stats": cleanup_stats,
+            "message": "Cleanup completed successfully" if not cleanup_stats["errors"] else "Cleanup completed with some errors"
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "cleanup_stats": cleanup_stats
+        }), 500
 
 if __name__ == '__main__':
-    socketio.run(app, debug=False)
+    socketio.run(app, debug=True)

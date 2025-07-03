@@ -1,0 +1,9 @@
+[submodule "stable-audio-api"]
+	path = stable-audio-api
+	url = https://github.com/betweentwomidnights/stable-audio-api.git
+[submodule "gpu-queue-service"]
+	path = gpu-queue-service
+	url = https://github.com/betweentwomidnights/gpu-queue-service.git
+[submodule "melodyflow"]
+	path = melodyflow
+	url = https://github.com/betweentwomidnights/melodyflow.git

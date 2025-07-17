@@ -2,6 +2,10 @@
 
 this is the backend for [gary4live](https://github.com/betweentwomidnights/gary4live), the max for live device for iterating on your existing ableton projects.
 
+it's also the backend for gary4beatbox, a free ios/android app that does almost all the same stuff using your mic as input audio (or stable audio open small)
+
+https://thecollabagepatch.com/redirect.html
+
 we run this backend for free at `g4l.thecollabagepatch.com` and collect zero user data cuz that would be too much work. but if you want to run it locally, here's how.
 
 ## july 2025 update - modular architecture

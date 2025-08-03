@@ -178,6 +178,18 @@ def cleanup_temp_file(file_path):
         print(f"Error cleaning up temp file {file_path}: {e}")
 
 # =============================================================================
+# ADDITIONAL REDIS FUNCTIONS FOR LAST INPUT AUDIO
+# =============================================================================
+
+def store_last_input_audio(session_id: str, audio_base64: str):
+    """Store last input audio for retry functionality."""
+    redis_client.setex(f"last_input:{session_id}", 3600, audio_base64)
+
+def get_last_input_audio(session_id: str):
+    """Get last input audio for retry."""
+    return redis_client.get(f"last_input:{session_id}")
+
+# =============================================================================
 # CORE PROCESSING FUNCTIONS
 # =============================================================================
 
@@ -231,7 +243,10 @@ def run_audio_processing(session_id: str, audio_data: str, model_name: str,
 
 def run_continue_processing(session_id: str, audio_data: str, model_name: str,
                           prompt_duration: int, **kwargs):
-    """Run continuation processing with progress tracking."""
+    """
+    Run continuation processing with progress tracking.
+    Now stores last input audio for retry functionality.
+    """
     def progress_callback(current, total):
         progress_percent = int((current / total) * 100)
         store_session_progress(session_id, progress_percent)
@@ -240,6 +255,9 @@ def run_continue_processing(session_id: str, audio_data: str, model_name: str,
         try:
             store_session_status(session_id, "processing")
             store_session_progress(session_id, 0)
+            
+            # Store input audio for potential retry (THIS IS KEY!)
+            store_last_input_audio(session_id, audio_data)
             
             with force_gpu_cleanup():
                 result_base64 = continue_music(
@@ -302,7 +320,7 @@ def run_transform_processing(session_id: str, audio_data: str, variation: str, *
             if kwargs.get('custom_prompt'):
                 payload['custom_prompt'] = kwargs['custom_prompt']
             
-            response = requests.post(melodyflow_url, json=payload, timeout=300)
+            response = requests.post(melodyflow_url, json=payload, timeout=900)
             
             if response.status_code == 200:
                 # MelodyFlow now returns a file, so we need to handle that
@@ -462,7 +480,7 @@ def juce_continue_music():
 
 @app.route('/api/juce/retry_music', methods=['POST'])
 def juce_retry_music():
-    """Retry music generation with new parameters."""
+    """Retry music generation with new parameters - FIXED VERSION."""
     try:
         request_data = SessionRequest(**request.json)
         old_session_id = request_data.session_id
@@ -473,10 +491,10 @@ def juce_retry_music():
         if not old_session_data:
             return jsonify({'success': False, 'error': 'Original session not found'}), 404
         
-        # Get original audio result (this becomes input for retry)
-        audio_data = get_audio_result(old_session_id)
-        if not audio_data:
-            return jsonify({'success': False, 'error': 'No audio data found for retry'}), 404
+        # FIXED: Get last INPUT audio (not result audio!)
+        last_input_audio = get_last_input_audio(old_session_id)
+        if not last_input_audio:
+            return jsonify({'success': False, 'error': 'No last input audio found for retry'}), 404
         
         # Create new session with updated parameters
         new_session_data = old_session_data.copy()
@@ -492,10 +510,10 @@ def juce_retry_music():
         
         store_session_data(new_session_id, new_session_data)
         
-        # Start retry processing (using continue logic)
+        # FIXED: Start retry processing using last INPUT audio (not result audio)
         run_continue_processing(
             new_session_id,
-            audio_data,
+            last_input_audio,  # Use the input audio that was used in the previous continuation
             new_session_data['model_name'],
             new_session_data['prompt_duration'],
             top_k=request_data.top_k,

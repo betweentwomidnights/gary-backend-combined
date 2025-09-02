@@ -177,6 +177,15 @@ def cleanup_temp_file(file_path):
     except Exception as e:
         print(f"Error cleaning up temp file {file_path}: {e}")
 
+def store_queue_status_update(session_id: str, payload: dict):
+    """Store queue/warmup/processing hints for the poller."""
+    redis_client.setex(f"queue_status:{session_id}", 3600, json.dumps(payload))
+
+def get_stored_queue_status(session_id: str):
+    """Retrieve last queue/warmup/processing hint."""
+    data = redis_client.get(f"queue_status:{session_id}")
+    return json.loads(data) if data else None
+
 # =============================================================================
 # ADDITIONAL REDIS FUNCTIONS FOR LAST INPUT AUDIO
 # =============================================================================
@@ -193,25 +202,41 @@ def get_last_input_audio(session_id: str):
 # CORE PROCESSING FUNCTIONS
 # =============================================================================
 
-def run_audio_processing(session_id: str, audio_data: str, model_name: str, 
+def run_audio_processing(session_id: str, audio_data: str, model_name: str,
                         prompt_duration: int, **kwargs):
-    """
-    Run audio processing in a separate thread with progress tracking.
-    Merges logic from handle_task_ready into direct processing.
-    """
     def progress_callback(current, total):
         progress_percent = int((current / total) * 100)
         store_session_progress(session_id, progress_percent)
-        print(f"[PROGRESS] {session_id}: {progress_percent}%")
+
+        # FIRST nonzero progress => leave warming
+        if progress_percent > 0:
+            store_session_status(session_id, "processing")
+            store_queue_status_update(session_id, {
+                "status": "processing",
+                "message": "generating…",
+                "position": 0,
+                "total_queued": 0,
+                "estimated_time": None,
+                "estimated_seconds": 0,
+                "source": "localhost"
+            })
 
     def processing_thread():
         try:
-            # Mark as processing
-            store_session_status(session_id, "processing")
+            # Tell poller we are warming (this is BEFORE model load / HF download)
+            store_session_status(session_id, "warming")
             store_session_progress(session_id, 0)
-            
+            store_queue_status_update(session_id, {
+                "status": "warming",
+                "message": f'loading {model_name} (first run / hub download)',
+                "position": 0,
+                "total_queued": 0,
+                "estimated_time": None,
+                "estimated_seconds": 0,
+                "source": "localhost"
+            })
+
             with force_gpu_cleanup():
-                # Call the actual audio processing function
                 result_base64 = process_audio(
                     audio_data,
                     model_name,
@@ -222,43 +247,62 @@ def run_audio_processing(session_id: str, audio_data: str, model_name: str,
                     cfg_coef=kwargs.get('cfg_coef', 3.0),
                     description=kwargs.get('description', '')
                 )
-                
-                # Store results (same format as remote backend)
+
                 store_audio_result(session_id, result_base64)
                 store_session_status(session_id, "completed")
                 store_session_progress(session_id, 100)
-                
+                store_queue_status_update(session_id, {
+                    "status": "completed",
+                    "message": "done",
+                    "source": "localhost"
+                })
                 print(f"[SUCCESS] Audio processing completed for {session_id}")
-                
+
         except Exception as e:
             print(f"[ERROR] Audio processing failed for {session_id}: {e}")
             store_session_status(session_id, "failed", str(e))
+            store_queue_status_update(session_id, {
+                "status": "failed",
+                "message": str(e),
+                "source": "localhost"
+            })
         finally:
             clean_gpu_memory()
 
-    # Start processing in background thread
-    thread = threading.Thread(target=processing_thread)
-    thread.daemon = True
-    thread.start()
+    threading.Thread(target=processing_thread, daemon=True).start()
 
 def run_continue_processing(session_id: str, audio_data: str, model_name: str,
-                          prompt_duration: int, **kwargs):
-    """
-    Run continuation processing with progress tracking.
-    Now stores last input audio for retry functionality.
-    """
+                            prompt_duration: int, **kwargs):
     def progress_callback(current, total):
         progress_percent = int((current / total) * 100)
         store_session_progress(session_id, progress_percent)
+        if progress_percent > 0:
+            store_session_status(session_id, "processing")
+            store_queue_status_update(session_id, {
+                "status": "processing",
+                "message": "generating…",
+                "position": 0,
+                "total_queued": 0,
+                "estimated_time": None,
+                "estimated_seconds": 0,
+                "source": "localhost"
+            })
 
     def processing_thread():
         try:
-            store_session_status(session_id, "processing")
+            store_session_status(session_id, "warming")
             store_session_progress(session_id, 0)
-            
-            # Store input audio for potential retry (THIS IS KEY!)
             store_last_input_audio(session_id, audio_data)
-            
+            store_queue_status_update(session_id, {
+                "status": "warming",
+                "message": f'loading {model_name} (first run / hub download)',
+                "position": 0,
+                "total_queued": 0,
+                "estimated_time": None,
+                "estimated_seconds": 0,
+                "source": "localhost"
+            })
+
             with force_gpu_cleanup():
                 result_base64 = continue_music(
                     audio_data,
@@ -270,86 +314,29 @@ def run_continue_processing(session_id: str, audio_data: str, model_name: str,
                     cfg_coef=kwargs.get('cfg_coef', 3.0),
                     description=kwargs.get('description', '')
                 )
-                
+
                 store_audio_result(session_id, result_base64)
                 store_session_status(session_id, "completed")
                 store_session_progress(session_id, 100)
-                
+                store_queue_status_update(session_id, {
+                    "status": "completed",
+                    "message": "done",
+                    "source": "localhost"
+                })
+
         except Exception as e:
             print(f"[ERROR] Continue processing failed for {session_id}: {e}")
             store_session_status(session_id, "failed", str(e))
+            store_queue_status_update(session_id, {
+                "status": "failed",
+                "message": str(e),
+                "source": "localhost"
+            })
         finally:
             clean_gpu_memory()
 
-    thread = threading.Thread(target=processing_thread)
-    thread.daemon = True
-    thread.start()
+    threading.Thread(target=processing_thread, daemon=True).start()
 
-def run_transform_processing(session_id: str, audio_data: str, variation: str, **kwargs):
-    """Run transform processing by calling MelodyFlow service on port 8002."""
-    import requests
-    
-    def progress_callback(current, total):
-        progress_percent = int((current / total) * 100)
-        store_session_progress(session_id, progress_percent)
-
-    def processing_thread():
-        temp_input_file = None
-        try:
-            store_session_status(session_id, "processing")
-            store_session_progress(session_id, 0)
-            
-            # Store original audio for undo functionality
-            store_original_audio(session_id, audio_data)
-            
-            # Write audio to temporary file instead of sending base64
-            temp_input_file = write_audio_to_temp_file(audio_data, session_id)
-            if not temp_input_file:
-                raise Exception("Failed to write audio to temporary file")
-            
-            # Call MelodyFlow service with file path
-            melodyflow_url = "http://localhost:8002/transform"
-            payload = {
-                "audio_file_path": temp_input_file,  # Send file path instead of base64
-                "variation": variation,
-                "session_id": session_id,  # Include session_id for progress tracking
-                "flowstep": kwargs.get('flowstep', 0.13),
-                "solver": kwargs.get('solver', 'euler')
-            }
-            
-            if kwargs.get('custom_prompt'):
-                payload['custom_prompt'] = kwargs['custom_prompt']
-            
-            response = requests.post(melodyflow_url, json=payload, timeout=900)
-            
-            if response.status_code == 200:
-                # MelodyFlow now returns a file, so we need to handle that
-                if response.headers.get('content-type') == 'audio/wav':
-                    # Convert file response back to base64
-                    result_base64 = base64.b64encode(response.content).decode('utf-8')
-                    store_audio_result(session_id, result_base64)
-                    store_session_status(session_id, "completed")
-                    store_session_progress(session_id, 100)
-                else:
-                    # Handle JSON response (error case)
-                    result_data = response.json()
-                    if result_data.get('error'):
-                        raise Exception(result_data.get('error', 'Transform failed'))
-            else:
-                raise Exception(f"MelodyFlow service error: {response.status_code}")
-                
-        except Exception as e:
-            print(f"[ERROR] Transform processing failed for {session_id}: {e}")
-            store_session_status(session_id, "failed", str(e))
-        finally:
-            # Clean up temp file
-            if temp_input_file:
-                cleanup_temp_file(temp_input_file)
-            clean_gpu_memory()
-
-    thread = threading.Thread(target=processing_thread)
-    thread.daemon = True
-    thread.start()
 
 # =============================================================================
 # HTTP ENDPOINTS (Same interface as remote backend)
@@ -533,43 +520,6 @@ def juce_retry_music():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/juce/transform_audio', methods=['POST'])
-def juce_transform_audio():
-    """Transform audio using MelodyFlow."""
-    try:
-        request_data = TransformRequest(**request.json)
-        session_id = generate_session_id()
-        
-        # Store session data
-        session_data = {
-            'session_id': session_id,
-            'variation': request_data.variation,
-            'type': 'transform',
-            'created_at': datetime.now(timezone.utc).isoformat()
-        }
-        store_session_data(session_id, session_data)
-        
-        # Start transform processing
-        run_transform_processing(
-            session_id,
-            request_data.audio_data,
-            request_data.variation,
-            flowstep=request_data.flowstep,
-            solver=request_data.solver,
-            custom_prompt=request_data.custom_prompt
-        )
-        
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'message': 'Transform processing started'
-        })
-        
-    except ValidationError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
 @app.route('/api/juce/undo_transform', methods=['POST'])
 def juce_undo_transform():
     """Undo last transform by returning original audio."""
@@ -596,41 +546,55 @@ def juce_undo_transform():
 
 @app.route('/api/juce/poll_status/<session_id>', methods=['GET'])
 def juce_poll_status(session_id):
-    """Poll for session status and results (same interface as remote)."""
     try:
-        # Get current status
-        status_data = get_session_status(session_id)
+        status_data = get_session_status(session_id)      # {"status": "...", "error": "...?"}
         progress = get_session_progress(session_id)
-        
+        qstatus = get_stored_queue_status(session_id)     # may be None
+
+        # Synthesize a warming hint if we look idle-but-working and nothing is stored yet
+        if (status_data.get('status') in ('warming', 'processing') and progress == 0 and not qstatus):
+            sess = get_session_data(session_id) or {}
+            model_name = (sess.get('model_name') or 'model')
+            qstatus = {
+                "status": "warming",
+                "message": f'loading {model_name} (first run / hub download)',
+                "position": 0,
+                "total_queued": 0,
+                "estimated_time": None,
+                "estimated_seconds": 0,
+                "source": "synthetic-localhost"
+            }
+
         response = {
-            'success': True,
-            'status': status_data.get('status', 'unknown'),
-            'progress': progress
+            "success": True,
+            "status": status_data.get("status", "unknown"),
+            "progress": progress,
+            "queue_status": qstatus or {}
         }
-        
-        # Add generation_in_progress flag for JUCE compatibility
-        if status_data.get('status') == 'processing':
-            response['generation_in_progress'] = True
-            response['transform_in_progress'] = False  # Add this for Terry compatibility
-        elif status_data.get('status') == 'completed':
-            response['generation_in_progress'] = False
-            response['transform_in_progress'] = False
-            # Include audio data if available
+
+        # Keep JUCE flags consistent with remote
+        if status_data.get("status") in ("warming", "processing"):
+            response["generation_in_progress"] = True
+            response["transform_in_progress"] = False
+        elif status_data.get("status") == "completed":
+            response["generation_in_progress"] = False
+            response["transform_in_progress"] = False
             audio_result = get_audio_result(session_id)
             if audio_result:
-                response['audio_data'] = audio_result
-        elif status_data.get('status') == 'failed':
-            response['generation_in_progress'] = False
-            response['transform_in_progress'] = False
-            response['error'] = status_data.get('error', 'Unknown error')
+                response["audio_data"] = audio_result
+        elif status_data.get("status") == "failed":
+            response["generation_in_progress"] = False
+            response["transform_in_progress"] = False
+            response["error"] = status_data.get("error", "Unknown error")
         else:
-            response['generation_in_progress'] = False
-            response['transform_in_progress'] = False
-        
+            response["generation_in_progress"] = False
+            response["transform_in_progress"] = False
+
         return jsonify(response)
-        
+
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 # =============================================================================
 # MAIN APPLICATION

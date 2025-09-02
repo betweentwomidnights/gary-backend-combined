@@ -16,7 +16,7 @@ import os
 
 def configure_cuda_for_stability():
     """
-    Configure CUDA settings to prevent the rare dtype issue. don't think we've fully solved it yet.
+    Configure CUDA settings to prevent dtype issues under heavy concurrent load.
     
     This function applies multiple stability-focused settings:
     1. Disables TF32 automatic optimization

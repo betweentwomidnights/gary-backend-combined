@@ -2,7 +2,7 @@ import gevent.monkey
 gevent.monkey.patch_all()
 
 import flask
-from flask import Flask, jsonify, request, copy_current_request_context
+from flask import Flask, jsonify, request, copy_current_request_context, abort
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from socketio import Client  # Add this import at the top with other imports
 import gevent
@@ -170,7 +170,7 @@ socketio = SocketIO(
     ping_timeout=240,  # Use snake_case
     ping_interval=120,  # Use snake_case
     max_http_buffer_size=64*1024*1024,
-    ping_timeout_callback=lambda: clean_gpu_memory()  # Add cleanup on ping timeout
+    ping_timeout_callback=lambda: clean_gpu_memory(),  # Add cleanup on ping timeout
 )
 
 @app.route('/')
@@ -279,7 +279,7 @@ def smart_emit(event, data, room=None, namespace=None, force=False):
         force: Whether to bypass throttling (for critical messages)
     """
     session_id = data.get('session_id', room) if isinstance(data, dict) else room
-    
+
     # For events without a session_id or room, emit directly
     if not session_id:
         try:
@@ -646,7 +646,9 @@ def get_queue_status_message(queue_response):
         message = "Starting generation now..."
     elif task_status == 'queued':
         message = (f"Task queued successfully. You are number {queued_tasks} in the queue. "
-                  f"Estimated wait time: {format_time_estimate(estimated_wait)}.")
+                f"Estimated wait time: {format_time_estimate(estimated_wait)}.")
+    elif task_status in ('warming', 'downloading', 'model_download'):
+        message = "Downloading model from Hugging Face (first run)…"
     else:
         message = "Request received, determining queue status..."
 
@@ -864,11 +866,82 @@ def retry_socket_emit(event, data, room, max_attempts=5, base_delay=0.1):
     
     return False
 
+# Add these helper functions to store progress/results for HTTP clients:
+
+def store_session_progress(session_id, progress):
+    """Store progress for HTTP polling clients"""
+    try:
+        redis_client.setex(f"progress:{session_id}", 3600, str(progress))  # 1 hour TTL
+    except:
+        pass
+
+def store_session_status(session_id, status, error_message=None):
+    """Store status for HTTP polling clients"""
+    try:
+        status_data = {
+            'status': status,
+            'timestamp': time.time()
+        }
+        if error_message:
+            status_data['error'] = error_message
+            
+        redis_client.setex(f"status:{session_id}", 3600, json.dumps(status_data))
+    except:
+        pass
+
+def get_session_progress(session_id):
+    """Get progress for HTTP polling clients"""
+    try:
+        progress = redis_client.get(f"progress:{session_id}")
+        return int(progress) if progress else 0
+    except:
+        return 0
+
+def get_session_status(session_id):
+    """Get status for HTTP polling clients"""
+    try:
+        status_data = redis_client.get(f"status:{session_id}")
+        return json.loads(status_data) if status_data else {'status': 'unknown'}
+    except:
+        return {'status': 'unknown'}
+    
+def store_queue_status_update(session_id, status_message):
+    """Store queue status update for HTTP polling clients"""
+    try:
+        queue_status_data = {
+            'message': status_message.get('message'),
+            'position': status_message.get('position'),
+            'total_queued': status_message.get('total_queued'),
+            'estimated_time': status_message.get('estimated_time'),
+            'estimated_seconds': status_message.get('estimated_seconds'),
+            'status': status_message.get('status'),
+            'session_id': session_id,
+            'timestamp': time.time(),
+            'notification_id': status_message.get('notification_id'),
+            'from_worker': status_message.get('from_worker', False)
+        }
+        
+        redis_client.setex(f"queue_status:{session_id}", 3600, json.dumps(queue_status_data))  # 1 hour TTL
+        print(f"[HTTP] Stored queue status update for {session_id}: {status_message.get('status')}")
+    except Exception as e:
+        print(f"[HTTP] Error storing queue status for {session_id}: {e}")
+
+def get_stored_queue_status(session_id):
+    """Get stored queue status for HTTP polling clients"""
+    try:
+        stored_data = redis_client.get(f"queue_status:{session_id}")
+        if stored_data:
+            return json.loads(stored_data.decode('utf-8'))
+        return None
+    except Exception as e:
+        print(f"[HTTP] Error retrieving stored queue status for {session_id}: {e}")
+        return None
+
 @app.route('/task_notification', methods=['POST'])
 def handle_task_notification():
     """
     Handle task notifications from the Go queue service with improved reliability.
-    This implementation minimizes blocking during active tasks.
+    Now supports both WebSocket and HTTP clients.
     """
     try:
         data = request.json
@@ -919,7 +992,7 @@ def handle_task_notification():
                 thread = enhanced_spawn(lambda: handle_task_ready_transform(session_id))
                 print(f"[QUEUE] Started handle_task_ready_transform for session {session_id}")
         
-        # Try immediate emit while we have request context
+        # Process queue status for both WebSocket and HTTP clients
         try:
             queue_status = data.get('queue_status', {})
             if isinstance(queue_status, dict):
@@ -930,14 +1003,17 @@ def handle_task_notification():
             status_message['session_id'] = session_id
             status_message['notification_id'] = notification_id
             
-            # Since we are in a request context, we can emit directly
+            # EXISTING: Emit for WebSocket clients (unchanged)
             smart_emit('queue_status', status_message, room=session_id, force=True)
+            
+            # NEW: Store for HTTP clients (following established pattern)
+            store_queue_status_update(session_id, status_message)
             
             # Mark as processed since we succeeded
             redis_client.hset(redis_key, 'immediate_emit', 'true')
             redis_client.hset(redis_key, 'processed', 'true')
             
-            print(f"[QUEUE] Successfully emitted queue_status for {session_id} in request handler")
+            print(f"[QUEUE] Successfully emitted and stored queue_status for {session_id}")
             
         except Exception as emit_error:
             # Just log the error - the worker will handle it
@@ -1032,26 +1108,51 @@ def handle_audio_processing(data):
     finally:
         thread_manager.cleanup_threads()
 
+# Modify the existing handle_task_ready function (BACKWARDS COMPATIBLE):
 def handle_task_ready(session_id):
     try:
+        print(f"[DEBUG] Starting handle_task_ready for {session_id}")
+        
         session_data = sessions.find_one({'_id': session_id})
-        print(f"Retrieved session data for {session_id}: {session_data}")
+        print(f"[DEBUG] Retrieved session data keys: {list(session_data.keys()) if session_data else 'None'}")
         
         if not session_data:
+            print(f"[ERROR] No session data found for {session_id}")
             raise ValueError(f"No session data found for {session_id}")
 
         # Verify required fields with types
-        model_name = str(session_data['model_name'])
-        prompt_duration = int(session_data['prompt_duration'])
+        try:
+            model_name = str(session_data['model_name'])
+            print(f"[DEBUG] Model name: {model_name}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get model_name: {e}")
+            raise
+            
+        try:
+            prompt_duration = int(session_data['prompt_duration'])
+            print(f"[DEBUG] Prompt duration: {prompt_duration}")
+        except Exception as e:
+            print(f"[ERROR] Failed to get prompt_duration: {e}")
+            raise
+            
         parameters = session_data.get('parameters', {})
+        print(f"[DEBUG] Parameters: {parameters}")
         
         # Get audio and verify
-        input_data_base64 = retrieve_audio_data(session_id, 'initial_audio')
+        try:
+            input_data_base64 = retrieve_audio_data(session_id, 'initial_audio')
+            print(f"[DEBUG] Retrieved audio data length: {len(input_data_base64) if input_data_base64 else 'None'}")
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve audio data: {e}")
+            raise
+            
         if not input_data_base64:
+            print(f"[ERROR] No audio data found for {session_id}")
             raise ValueError(f"No audio data found for {session_id}")
 
-        # Mark as processing
+        # Mark as processing (both for websocket and HTTP clients)
         set_generation_in_progress(session_id, True)
+        store_session_status(session_id, 'processing')  # NEW: For HTTP clients
 
          # Notify Go service that task is now processing
         requests.post(
@@ -1065,11 +1166,46 @@ def handle_task_ready(session_id):
         def audio_processing_thread():
             try:
                 with track_processes():
+                    published_processing = False  # <— add
+
                     def progress_callback(current, total):
                         progress_percent = (current / total) * 100
+
+                        # EXISTING ws emit
                         smart_emit('progress_update',
-                            {'progress': int(progress_percent), 'session_id': session_id}, 
-                            room=session_id)
+                                {'progress': int(progress_percent), 'session_id': session_id},
+                                room=session_id)
+
+                        # NEW: store for HTTP pollers
+                        store_session_progress(session_id, int(progress_percent))
+
+                        # NEW: first real progress => flip warming -> processing once
+                        nonlocal published_processing
+                        if not published_processing and progress_percent > 0:
+                            store_queue_status_update(session_id, {
+                                'status': 'processing',
+                                'message': 'generating…',
+                                'position': 0,
+                                'total_queued': 0,
+                                'estimated_time': None,
+                                'estimated_seconds': 0,
+                                'from_worker': True,
+                            })
+                            store_session_status(session_id, 'processing')
+                            published_processing = True
+
+                    # NEW: publish a warming hint before model load/download
+                    store_session_status(session_id, 'warming')
+                    store_queue_status_update(session_id, {
+                        'status': 'warming',
+                        'message': f'loading {model_name} (first run / hub download)',
+                        'position': 0,
+                        'total_queued': 0,
+                        'estimated_time': None,
+                        'estimated_seconds': 0,
+                        'from_worker': True,
+                    })
+
 
                     # Use our verified parameters
                     result_base64 = process_audio(
@@ -1083,10 +1219,16 @@ def handle_task_ready(session_id):
                         description=session_data.get('description')
                     )
                     
+                    # Store result (EXISTING - works for both websocket and HTTP)
                     store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    
+                    # EXISTING: Emit for websocket clients
                     socketio.emit('audio_processed',
                          {'audio_data': result_base64, 'session_id': session_id}, 
                          room=session_id)
+                    
+                    # NEW: Store completion status for HTTP clients
+                    store_session_status(session_id, 'completed')
 
                     # Notify Go service that task is complete
                     requests.post(
@@ -1099,7 +1241,13 @@ def handle_task_ready(session_id):
 
             except Exception as e:
                 print(f"Error during audio processing thread for session {session_id}: {e}")
+                
+                # EXISTING: Emit for websocket clients
                 socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                
+                # NEW: Store error for HTTP clients
+                store_session_status(session_id, 'failed', str(e))
+                
                 # Notify Go service of failure
                 requests.post(
                     'http://gpu-queue:8085/task/status',
@@ -1117,10 +1265,16 @@ def handle_task_ready(session_id):
 
     except Exception as e:
         print(f"Error in handle_task_ready for session {session_id}: {e}")
+        
+        # EXISTING: Emit for websocket clients
         socketio.emit('error', {
             'message': str(e),
             'session_id': session_id
         }, room=session_id)
+        
+        # NEW: Store error for HTTP clients
+        store_session_status(session_id, 'failed', str(e))
+        
         set_generation_in_progress(session_id, False)
 
 @socketio.on('continue_music_request')
@@ -1261,8 +1415,9 @@ def handle_task_ready_continue(session_id):
         prompt_duration = int(session_data['prompt_duration'])
         parameters = session_data.get('parameters', {})
         
-        # Mark as processing
+        # Mark as processing (both for websocket and HTTP clients)
         set_generation_in_progress(session_id, True)
+        store_session_status(session_id, 'processing')  # NEW: For HTTP clients
 
          # Notify Go service that task is now processing
         requests.post(
@@ -1276,11 +1431,43 @@ def handle_task_ready_continue(session_id):
         def continue_music_processing_thread():
             try:
                 with track_processes():
+                    published_processing = False  # <— add
+
                     def progress_callback(current, total):
                         progress_percent = (current / total) * 100
+
                         smart_emit('progress_update',
-                             {'progress': int(progress_percent), 'session_id': session_id}, 
-                             room=session_id)
+                                {'progress': int(progress_percent), 'session_id': session_id},
+                                room=session_id)
+
+                        store_session_progress(session_id, int(progress_percent))
+
+                        # NEW: flip warming -> processing on first progress
+                        nonlocal published_processing
+                        if not published_processing and progress_percent > 0:
+                            store_queue_status_update(session_id, {
+                                'status': 'processing',
+                                'message': 'generating…',
+                                'position': 0,
+                                'total_queued': 0,
+                                'estimated_time': None,
+                                'estimated_seconds': 0,
+                                'from_worker': True,
+                            })
+                            store_session_status(session_id, 'processing')
+                            published_processing = True
+
+                    # NEW: publish warming before model load
+                    store_session_status(session_id, 'warming')
+                    store_queue_status_update(session_id, {
+                        'status': 'warming',
+                        'message': f'loading {model_name} (first run / hub download)',
+                        'position': 0,
+                        'total_queued': 0,
+                        'estimated_time': None,
+                        'estimated_seconds': 0,
+                        'from_worker': True,
+                    })
 
                     # Use verified parameters
                     result_base64 = continue_music(
@@ -1294,11 +1481,17 @@ def handle_task_ready_continue(session_id):
                         description=session_data.get('description')
                     )
                     
+                    # Store results (EXISTING - works for both websocket and HTTP)
                     store_audio_data(session_id, input_data_base64, 'last_input_audio')
                     store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    
+                    # EXISTING: Emit for websocket clients
                     socketio.emit('music_continued',
                          {'audio_data': result_base64, 'session_id': session_id}, 
                          room=session_id)
+                    
+                    # NEW: Store completion status for HTTP clients
+                    store_session_status(session_id, 'completed')
 
                     # Notify Go service that task is complete
                     requests.post(
@@ -1311,7 +1504,13 @@ def handle_task_ready_continue(session_id):
 
             except Exception as e:
                 print(f"Error during continue music processing thread for session {session_id}: {e}")
+                
+                # EXISTING: Emit for websocket clients
                 socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                
+                # NEW: Store error for HTTP clients
+                store_session_status(session_id, 'failed', str(e))
+                
                 # Notify Go service of failure
                 requests.post(
                     'http://gpu-queue:8085/task/status',
@@ -1329,10 +1528,16 @@ def handle_task_ready_continue(session_id):
 
     except Exception as e:
         print(f"Error in handle_task_ready_continue for session {session_id}: {e}")
+        
+        # EXISTING: Emit for websocket clients
         socketio.emit('error', {
             'message': str(e),
             'session_id': session_id
         }, room=session_id)
+        
+        # NEW: Store error for HTTP clients  
+        store_session_status(session_id, 'failed', str(e))
+        
         set_generation_in_progress(session_id, False)
 
 @socketio.on('retry_music_request')
@@ -1446,10 +1651,13 @@ def handle_task_ready_retry(session_id):
         prompt_duration = int(session_data['prompt_duration'])
         parameters = session_data.get('parameters', {})
         
-        # Mark as processing
+        # Mark as processing (both for websocket and HTTP clients)
         set_generation_in_progress(session_id, True)
+        store_session_status(session_id, 'processing')  # NEW: For HTTP clients
 
-         # Notify Go service that task is now processing
+        store_session_progress(session_id, 0)
+
+        # Notify Go service that task is now processing
         requests.post(
             'http://gpu-queue:8085/task/status',
             json={
@@ -1461,11 +1669,43 @@ def handle_task_ready_retry(session_id):
         def retry_music_processing_thread():
             try:
                 with track_processes():
+                    published_processing = False  # <— add
+
                     def progress_callback(current, total):
                         progress_percent = (current / total) * 100
+
                         smart_emit('progress_update',
-                             {'progress': int(progress_percent), 'session_id': session_id}, 
-                             room=session_id)
+                                {'progress': int(progress_percent), 'session_id': session_id},
+                                room=session_id)
+
+                        store_session_progress(session_id, int(progress_percent))
+
+                        # NEW: flip warming -> processing on first progress
+                        nonlocal published_processing
+                        if not published_processing and progress_percent > 0:
+                            store_queue_status_update(session_id, {
+                                'status': 'processing',
+                                'message': 'generating…',
+                                'position': 0,
+                                'total_queued': 0,
+                                'estimated_time': None,
+                                'estimated_seconds': 0,
+                                'from_worker': True,
+                            })
+                            store_session_status(session_id, 'processing')
+                            published_processing = True
+
+                    # NEW: publish warming before model load
+                    store_session_status(session_id, 'warming')
+                    store_queue_status_update(session_id, {
+                        'status': 'warming',
+                        'message': f'loading {model_name} (first run / hub download)',
+                        'position': 0,
+                        'total_queued': 0,
+                        'estimated_time': None,
+                        'estimated_seconds': 0,
+                        'from_worker': True,
+                    })
 
                     # Use verified parameters
                     result_base64 = continue_music(
@@ -1479,12 +1719,17 @@ def handle_task_ready_retry(session_id):
                         description=session_data.get('description')
                     )
                     
-                    # Store the same input audio again for potential future retries
+                    # Store results (EXISTING - works for both websocket and HTTP)
                     store_audio_data(session_id, input_data_base64, 'last_input_audio')
                     store_audio_data(session_id, result_base64, 'last_processed_audio')
+                    
+                    # EXISTING: Emit for websocket clients
                     socketio.emit('music_retried',
                          {'audio_data': result_base64, 'session_id': session_id}, 
                          room=session_id)
+                    
+                    # NEW: Store completion status for HTTP clients
+                    store_session_status(session_id, 'completed')
 
                     # Notify Go service that task is complete
                     requests.post(
@@ -1497,7 +1742,13 @@ def handle_task_ready_retry(session_id):
 
             except Exception as e:
                 print(f"Error during retry music processing thread for session {session_id}: {e}")
+                
+                # EXISTING: Emit for websocket clients
                 socketio.emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                
+                # NEW: Store error for HTTP clients
+                store_session_status(session_id, 'failed', str(e))
+                
                 # Notify Go service of failure
                 requests.post(
                     'http://gpu-queue:8085/task/status',
@@ -1515,10 +1766,16 @@ def handle_task_ready_retry(session_id):
 
     except Exception as e:
         print(f"Error in handle_task_ready_retry for session {session_id}: {e}")
+        
+        # EXISTING: Emit for websocket clients
         socketio.emit('error', {
             'message': str(e),
             'session_id': session_id
         }, room=session_id)
+        
+        # NEW: Store error for HTTP clients  
+        store_session_status(session_id, 'failed', str(e))
+        
         set_generation_in_progress(session_id, False)
 
 @socketio.on('update_cropped_audio')
@@ -1871,8 +2128,9 @@ def handle_task_ready_transform(session_id):
 
         task_data = json.loads(task_data_json.decode('utf-8'))
         
-        # Set transform in progress in Redis
+        # Set transform in progress in Redis AND store status for HTTP clients
         set_transform_in_progress(session_id, True)
+        store_session_status(session_id, 'processing')  # NEW: For HTTP clients
         
         # Notify Go service that task is now processing
         requests.post(
@@ -1898,10 +2156,16 @@ def handle_task_ready_transform(session_id):
                     @flask_socket.on('progress')
                     def handle_progress(data):
                         if data.get('session_id') == session_id:
+                            progress_percent = data.get('progress', 0)
+                            
+                            # EXISTING: Emit for websocket clients
                             context_emit('progress_update', {
-                                'progress': data.get('progress', 0),
+                                'progress': progress_percent,
                                 'session_id': session_id
                             })
+                            
+                            # NEW: Store for HTTP clients
+                            store_session_progress(session_id, int(progress_percent))
 
                     print(f"[DEBUG] Connecting to MelodyFlow WebSocket for session {session_id}")
                     flask_socket.connect('http://melodyflow:8002', wait_timeout=30)
@@ -1956,17 +2220,25 @@ def handle_task_ready_transform(session_id):
                         max_size_bytes = 128 * 1024 * 1024
 
                         if result_size_bytes > max_size_bytes:
+                            # EXISTING: Emit for websocket clients
                             smart_emit('error', {
                                 'message': 'Transformed audio data is too large to send.',
                                 'session_id': session_id,
                                 'code': 'DATA_TOO_LARGE'
                             }, room=session_id)
+                            
+                            # NEW: Store error for HTTP clients
+                            store_session_status(session_id, 'failed', 'Transformed audio data is too large to send.')
                         else:
+                            # EXISTING: Emit for websocket clients
                             smart_emit('audio_transformed', {
                                 'audio_data': result_base64,
                                 'session_id': session_id,
                                 'variation': task_data.get('variation')
                             }, room=session_id, force=True)
+                            
+                            # NEW: Store completion status for HTTP clients
+                            store_session_status(session_id, 'completed')
                             
                     elif response.status_code == 202:
                         # Queued processing - let MelodyFlow handle it
@@ -1977,6 +2249,9 @@ def handle_task_ready_transform(session_id):
                             raise ValueError("No job_id in MelodyFlow response")
                             
                         print(f"[DEBUG] MelodyFlow job ID: {job_id} for session {session_id}")
+                        
+                        # Note: Progress updates will continue to come through the WebSocket
+                        # and will be handled by the @flask_socket.on('progress') handler above
                         
                     else:
                         # Error occurred
@@ -1996,7 +2271,12 @@ def handle_task_ready_transform(session_id):
                 print(f"[DEBUG] Exception in transform_audio_thread for session {session_id}: {e}")
                 import traceback
                 traceback.print_exc()
+                
+                # EXISTING: Emit for websocket clients
                 smart_emit('error', {'message': str(e), 'session_id': session_id}, room=session_id)
+                
+                # NEW: Store error for HTTP clients
+                store_session_status(session_id, 'failed', str(e))
                 
                 # Notify Go service of failure
                 try:
@@ -2028,10 +2308,15 @@ def handle_task_ready_transform(session_id):
     except Exception as e:
         print(f"Error in handle_task_ready_transform for session {session_id}: {e}")
         cleanup_temp_file(temp_input_file if 'temp_input_file' in locals() else None)
+        
+        # EXISTING: Emit for websocket clients
         smart_emit('error', {
             'message': str(e),
             'session_id': session_id
         }, room=session_id)
+        
+        # NEW: Store error for HTTP clients
+        store_session_status(session_id, 'failed', str(e))
         
         # Update task status to failed in queue
         try:
@@ -2234,6 +2519,415 @@ def cleanup_old_sessions():
             "message": str(e),
             "cleanup_stats": cleanup_stats
         }), 500
+    
+# MARK: http version
+    
+@app.route('/api/juce/process_audio', methods=['POST'])
+def juce_process_audio():
+    """Start audio processing - returns minimal response, real queue status comes via polling"""
+    try:
+        print(f"[DEBUG] HTTP endpoint called")
+        
+        # Step 1: Get raw data
+        raw_data = request.json
+        print(f"[DEBUG] Raw received data keys: {list(raw_data.keys()) if raw_data else 'None'}")
+        
+        # Step 2: Clean the data FIRST (like WebSocket handler does)
+        try:
+            cleaned_data = parse_client_data(raw_data)
+            print(f"[DEBUG] After cleaning data keys: {list(cleaned_data.keys()) if cleaned_data else 'None'}")
+        except ValueError as e:
+            print(f"[ERROR] Data cleaning failed: {str(e)}")
+            return jsonify({'success': False, 'error': str(e)}), 400
+        
+        # Step 3: Validate CLEANED data
+        request_data = AudioRequest(**cleaned_data)  # ✅ Use cleaned data
+        print(f"[DEBUG] AudioRequest validation passed")
+        print(f"[DEBUG] Model: {request_data.model_name}")
+        print(f"[DEBUG] Duration: {request_data.prompt_duration} (type: {type(request_data.prompt_duration)})")
+        
+        # Check audio data size
+        audio_data = cleaned_data.get('audio_data', '')
+        print(f"[DEBUG] Audio data length: {len(audio_data)}")
+        
+        session_id = generate_session_id()
+        print(f"[DEBUG] Generated session_id: {session_id}")
+        
+        # Step 4: Use CLEANED data for session creation
+        mongo_data = {
+            '_id': session_id,
+            'model_name': str(request_data.model_name),
+            'prompt_duration': int(request_data.prompt_duration),
+            'parameters': {
+                'top_k': int(request_data.top_k) if request_data.top_k is not None else 250,
+                'temperature': float(request_data.temperature) if request_data.temperature is not None else 1.0,
+                'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0,
+            },
+            'description': request_data.description,
+            'created_at': datetime.now(timezone.utc)
+        }
+        print(f"[DEBUG] MongoDB data prepared: {mongo_data}")
+        
+        result = sessions.update_one({'_id': session_id}, {'$set': mongo_data}, upsert=True)
+        print(f"[DEBUG] MongoDB insert result: matched={result.matched_count}, modified={result.modified_count}")
+        
+        # Step 5: Store audio data from CLEANED data
+        print(f"[DEBUG] Storing audio data...")
+        store_audio_data(session_id, request_data.audio_data, 'initial_audio')
+        print(f"[DEBUG] Audio data stored successfully")
+        
+        # Step 6: Queue task with CLEANED data
+        print(f"[DEBUG] Queueing task...")
+        queue_response = queue_task(session_id, 'process_audio', cleaned_data)  # ✅ Use cleaned data
+        print(f"[DEBUG] Queue response: {queue_response}")
+        
+        if not queue_response:
+            print(f"[ERROR] Failed to queue task")
+            return jsonify({'success': False, 'error': 'Failed to queue task'}), 500
+        
+        print(f"[DEBUG] HTTP endpoint completed successfully")
+        
+        # UPDATED: Return minimal response - let polling handle real-time queue status
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Audio processing queued successfully',
+            'note': 'Poll /api/juce/poll_status/{session_id} for real-time queue status and results'
+        })
+        
+    except ValidationError as e:
+        print(f"[ERROR] Validation error: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        print(f"[ERROR] Unexpected error in HTTP endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/juce/continue_music', methods=['POST'])
+def juce_continue_music():
+    """Continue music from existing session - equivalent to 'continue_music_request' event"""
+    try:
+        data = request.json
+        request_data = ContinueMusicRequest(**data)
+        session_id = request_data.session_id
+        
+        # Auto-create session if audio_data provided (same logic as Socket.IO)
+        if not session_id and request_data.audio_data:
+            session_id = generate_session_id()
+            mongo_data = {
+                '_id': session_id,
+                'model_name': request_data.model_name or 'thepatch/vanya_ai_dnb_0.1',
+                'prompt_duration': request_data.prompt_duration or 6,
+                'parameters': {
+                    'top_k': int(request_data.top_k) if request_data.top_k else 250,
+                    'temperature': float(request_data.temperature) if request_data.temperature else 1.0,
+                    'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef else 3.0,
+                },
+                'description': request_data.description,
+                'created_at': datetime.now(timezone.utc),
+                'created_from': 'juce_continue'
+            }
+            sessions.update_one({'_id': session_id}, {'$set': mongo_data}, upsert=True)
+            store_audio_data(session_id, request_data.audio_data, 'last_processed_audio')
+        
+        elif not session_id:
+            return jsonify({'success': False, 'error': 'Session ID required'}), 400
+        
+        if is_generation_in_progress(session_id):
+            return jsonify({'success': False, 'error': 'Generation already in progress'}), 400
+        
+        # Same parameter handling as Socket.IO
+        session_data = sessions.find_one({'_id': session_id})
+        if not session_data:
+            return jsonify({'success': False, 'error': 'Session not found'}), 404
+        
+        model_name = request_data.model_name or session_data.get('model_name')
+        prompt_duration = request_data.prompt_duration or session_data.get('prompt_duration')
+        
+        # Store audio data if provided
+        if request_data.audio_data:
+            store_audio_data(session_id, request_data.audio_data, 'last_processed_audio')
+        
+        task_data = {
+            'model_name': model_name,
+            'prompt_duration': prompt_duration,
+            'top_k': int(request_data.top_k) if request_data.top_k is not None else 250,
+            'temperature': float(request_data.temperature) if request_data.temperature is not None else 1.0,
+            'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0,
+            'description': request_data.description
+        }
+        
+        queue_response = queue_task(session_id, 'continue_music', task_data)
+        if not queue_response:
+            return jsonify({'success': False, 'error': 'Failed to queue task'}), 500
+        
+        # UPDATED: Return minimal response - let polling handle real-time queue status
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Music continuation queued successfully',
+            'note': 'Poll /api/juce/poll_status/{session_id} for real-time queue status and results'
+        })
+        
+    except ValidationError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/juce/transform_audio', methods=['POST'])
+def juce_transform_audio():
+    """Transform audio - equivalent to 'transform_audio_request' event"""
+    try:
+        data = request.json
+        request_data = TransformRequest(**data)
+        session_id = request_data.session_id or generate_session_id()
+        
+        if is_transform_in_progress(session_id):
+            return jsonify({'success': False, 'error': 'Transform already in progress'}), 400
+        
+        # Get audio data (same logic as Socket.IO)
+        if request_data.audio_data:
+            input_data_base64 = request_data.audio_data
+        else:
+            input_data_base64 = retrieve_audio_data(session_id, 'last_processed_audio')
+            if input_data_base64 is None:
+                return jsonify({'success': False, 'error': 'No audio data available'}), 400
+        
+        # Store transform input (for undo functionality)
+        store_audio_data(session_id, input_data_base64, 'transform_input_audio')
+        
+        task_data = {
+            'variation': request_data.variation,
+            'session_id': session_id
+        }
+        
+        if hasattr(request_data, 'flowstep') and request_data.flowstep is not None:
+            task_data['flowstep'] = request_data.flowstep
+        if hasattr(request_data, 'solver') and request_data.solver is not None:
+            task_data['solver'] = request_data.solver.lower()
+        if hasattr(request_data, 'custom_prompt') and request_data.custom_prompt is not None:
+            task_data['custom_prompt'] = request_data.custom_prompt
+        
+        store_transform_task_data(session_id, task_data)
+        
+        queue_response = queue_transform_task(session_id, 'transform_audio', task_data)
+        if not queue_response:
+            return jsonify({'success': False, 'error': 'Failed to queue transform task'}), 500
+        
+        # UPDATED: Return minimal response - let polling handle real-time queue status
+        # This is especially important for transforms since only 1 can run at a time!
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Audio transform queued successfully',
+            'note': 'Poll /api/juce/poll_status/{session_id} for real-time queue status and results',
+            'info': 'Transform model allows only 1 active task - queue status will show accurate wait times'
+        })
+        
+    except ValidationError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/juce/undo_transform', methods=['POST'])
+def juce_undo_transform():
+    """Undo transform - equivalent to 'undo_transform_request' event"""
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return jsonify({'success': False, 'error': 'Session ID required'}), 400
+        
+        # Retrieve the last input audio that was transformed
+        last_input_base64 = retrieve_audio_data(session_id, 'last_input_audio')
+        if last_input_base64 is None:
+            return jsonify({'success': False, 'error': 'No previous audio found to undo to'}), 400
+        
+        # Update the last_processed_audio to be the previous input
+        store_audio_data(session_id, last_input_base64, 'last_processed_audio')
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Transform undone',
+            'audio_data': last_input_base64
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/juce/retry_music', methods=['POST'])
+def juce_retry_music():
+    """Retry music generation - equivalent to 'retry_music_request' event"""
+    try:
+        data = request.json
+        request_data = SessionRequest(**data)
+        session_id = request_data.session_id
+        
+        if not session_id:
+            return jsonify({'success': False, 'error': 'Session ID required'}), 400
+        
+        if is_generation_in_progress(session_id):
+            return jsonify({'success': False, 'error': 'Generation already in progress'}), 400
+        
+        # Check for last input audio
+        last_input_base64 = retrieve_audio_data(session_id, 'last_input_audio')
+        if last_input_base64 is None:
+            return jsonify({'success': False, 'error': 'No last input audio available for retry'}), 400
+        
+        # Update session data in MongoDB (like websockets does)
+        mongo_data = {
+            'model_name': request_data.model_name,
+            'prompt_duration': request_data.prompt_duration,
+            'parameters': {
+                'top_k': int(request_data.top_k) if request_data.top_k is not None else 250,
+                'temperature': float(request_data.temperature) if request_data.temperature is not None else 1.0,
+                'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0,
+            },
+            'description': request_data.description,
+            'updated_at': datetime.now(timezone.utc)
+        }
+        
+        sessions.update_one(
+            {'_id': session_id},
+            {'$set': mongo_data},
+            upsert=True
+        )
+        
+        task_data = {
+            'model_name': request_data.model_name,
+            'prompt_duration': request_data.prompt_duration,
+            'top_k': int(request_data.top_k) if request_data.top_k is not None else 250,
+            'temperature': float(request_data.temperature) if request_data.temperature is not None else 1.0,
+            'cfg_coef': float(request_data.cfg_coef) if request_data.cfg_coef is not None else 3.0,
+            'description': request_data.description
+        }
+        
+        queue_response = queue_task(session_id, 'retry_music', task_data)
+        if not queue_response:
+            return jsonify({'success': False, 'error': 'Failed to queue task'}), 500
+        
+        # UPDATED: Return minimal response - let polling handle real-time queue status
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Music retry queued successfully',
+            'note': 'Poll /api/juce/poll_status/{session_id} for real-time queue status and results'
+        })
+        
+    except ValidationError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# Enhanced polling endpoint
+@app.route('/api/juce/poll_status/<session_id>')
+def juce_poll_status(session_id):
+    try:
+        generation_in_progress = is_generation_in_progress(session_id)
+        transform_in_progress = is_transform_in_progress(session_id)
+
+        session_data = sessions.find_one({'_id': session_id})
+        if not session_data:
+            return jsonify({'success': False, 'error': 'Session not found'}), 404
+
+        current_progress = get_session_progress(session_id)
+        current_status = get_session_status(session_id)
+
+        # Prefer stored updates
+        queue_status = get_stored_queue_status(session_id)
+
+        # Fallback: rapid, non-blocking peek at Go service
+        if not queue_status:
+            try:
+                resp = requests.get(f'http://gpu-queue:8085/tasks/{session_id}', timeout=0.25)  # NEW timeout
+                if resp.status_code == 200:
+                    go = resp.json()
+                    if go:
+                        queue_status = get_queue_status_message({'queue_status': go})
+                        queue_status['session_id'] = session_id
+                        queue_status['source'] = 'go_service_direct'
+            except Exception as e:
+                print(f"[HTTP] Go service lookup failed for {session_id}: {e}")
+                queue_status = {}
+
+        # NEW: synthesize warming if nothing else and we look idle-but-processing
+        if (generation_in_progress or transform_in_progress) and current_progress == 0 and (not queue_status or not queue_status.get('status')):
+            mn = session_data.get('model_name')
+            queue_status = {
+                'status': 'warming',
+                'message': f'loading {mn} (first run / hub download)',
+                'position': 0,
+                'total_queued': 0,
+                'estimated_time': None,
+                'estimated_seconds': 0,
+                'source': 'synthetic'
+            }
+
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'generation_in_progress': generation_in_progress,
+            'transform_in_progress': transform_in_progress,
+            'progress': current_progress,
+            'status': current_status['status'],
+            'error': current_status.get('error'),
+            'audio_data': None if (generation_in_progress or transform_in_progress) else retrieve_audio_data(session_id, 'last_processed_audio'),
+            'queue_status': queue_status,
+            'session_data': {
+                'model_name': session_data.get('model_name'),
+                'prompt_duration': session_data.get('prompt_duration'),
+                'parameters': session_data.get('parameters', {}),
+                'description': session_data.get('description')
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/juce/update_cropped_audio', methods=['POST'])
+def juce_update_cropped_audio():
+    """Update cropped audio - equivalent to 'update_cropped_audio' event"""
+    try:
+        data = request.json
+        session_id = data.get('session_id')
+        audio_data_base64 = data.get('audio_data')
+        
+        if not audio_data_base64:
+            return jsonify({'success': False, 'error': 'Missing audio_data'}), 400
+        
+        # Auto-create session if needed (same logic as Socket.IO)
+        if not session_id:
+            session_id = generate_session_id()
+            mongo_data = {
+                '_id': session_id,
+                'model_name': 'thepatch/vanya_ai_dnb_0.1',
+                'prompt_duration': 6,
+                'parameters': {
+                    'top_k': 250,
+                    'temperature': 1.0,
+                    'cfg_coef': 3.0,
+                },
+                'description': None,
+                'created_at': datetime.now(timezone.utc),
+                'created_from': 'juce_crop'
+            }
+            sessions.update_one({'_id': session_id}, {'$set': mongo_data}, upsert=True)
+        
+        # Store cropped audio as last_processed_audio
+        store_audio_data(session_id, audio_data_base64, 'last_processed_audio')
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Cropped audio updated - ready to continue',
+            'auto_created': not data.get('session_id')
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     socketio.run(app, debug=True)

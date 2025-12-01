@@ -6,9 +6,11 @@ gevent==22.10.2
 pymongo
 redis
 pydantic
-torchaudio
 torch==2.1.0
+av==12.3.0
 audiocraft
 gunicorn
 gevent-websocket
 flask_cors
+transformers==4.39.3
+torchaudio==2.1.0

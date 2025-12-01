@@ -1,3 +1,19 @@
+import os
+os.environ['HF_HOME'] = '/tmp/huggingface_cache'
+os.environ['TRANSFORMERS_CACHE'] = '/tmp/huggingface_cache'
+
+# --- begin Torch/Transformers compat shim (for PyTorch 2.1.x) ---
+try:
+    import torch
+    # only import if torch is present (it is), then alias _register→register for 2.1.x
+    from torch.utils import _pytree as _torch_pytree  # type: ignore
+    if (hasattr(_torch_pytree, "_register_pytree_node")
+            and not hasattr(_torch_pytree, "register_pytree_node")):
+        # mimic the newer API expected by recent transformers
+        _torch_pytree.register_pytree_node = _torch_pytree._register_pytree_node  # type: ignore[attr-defined]
+except Exception:
+    # don't hard-crash if anything is odd; worst case we fall back to the original error
+    pass
 import torchaudio
 import torch
 import numpy as np
@@ -12,11 +28,75 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from threading import Lock
 from functools import wraps
-import os
+
+# Add to g4laudio.py after imports
+from weakref import WeakValueDictionary
+import hashlib
+import time
+
+class ModelKernelCache:
+    """Cache compiled CUDA kernels across model instances."""
+    _instance = None
+    _lock = Lock()
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super(ModelKernelCache, cls).__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._kernel_cache = {}
+        self._initialized = True
+    
+    def get_cache_key(self, model_name, device_id):
+        """Generate a cache key for model+device combination."""
+        key_str = f"{model_name}_{device_id}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def has_warmed_kernels(self, model_name, device_id):
+        """Check if we've already warmed up kernels for this model."""
+        key = self.get_cache_key(model_name, device_id)
+        return key in self._kernel_cache
+    
+    def mark_kernels_warmed(self, model_name, device_id):
+        """Mark kernels as warmed for this model."""
+        key = self.get_cache_key(model_name, device_id)
+        self._kernel_cache[key] = {
+            'warmed_at': time.time(),
+            'model_name': model_name,
+            'device_id': device_id
+        }
+        print(f"[KERNEL] Marked kernels as warmed for {model_name} on device {device_id}")
+
+# Global instance
+kernel_cache = ModelKernelCache()
+
+def aggressive_cpu_cleanup():
+    """More thorough cleanup of CPU memory."""
+    import ctypes
+    
+    # Force garbage collection
+    for _ in range(3):
+        gc.collect()
+    
+    # Release memory back to OS (Linux)
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except:
+        pass
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
 def configure_cuda_for_stability():
     """
-    Configure CUDA settings to prevent the rare dtype issue. don't think we've fully solved it yet.
+    Configure CUDA settings to prevent dtype issues under heavy concurrent load.
     
     This function applies multiple stability-focused settings:
     1. Disables TF32 automatic optimization
@@ -74,38 +154,22 @@ def enforced_dtype_context():
 @contextmanager
 def cuda_execution_context(device_id=0):
     """
-    Context manager that provides a controlled environment for CUDA operations.
-    
-    This context:
-    1. Forces synchronous execution
-    2. Ensures operations stay on the selected device
-    3. Manages memory between operations
-    4. Forces float32 precision
+    Simplified CUDA context - manages device and dtype only.
+    No forced synchronization - let PyTorch handle async operations.
     """
-    # Save original state
     orig_default_dtype = torch.get_default_dtype()
     
     try:
-        # Set global default to float32 explicitly
         torch.set_default_dtype(torch.float32)
         
         if torch.cuda.is_available():
-            # Synchronize before execution
-            torch.cuda.synchronize(device_id)
-            
-            # Run operations in device context
             with torch.cuda.device(device_id):
                 yield
-                
-            # Synchronize after operations
-            torch.cuda.synchronize(device_id)
         else:
             yield
     finally:
-        # Restore original settings
         torch.set_default_dtype(orig_default_dtype)
-        
-        # Clear memory
+        # Lightweight cleanup only
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -208,11 +272,12 @@ class AudioConfig:
 
 @contextmanager
 def resource_cleanup():
-    """Context manager to ensure proper cleanup of GPU resources."""
+    """Lightweight resource cleanup - no forced synchronization."""
     try:
         yield
     finally:
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
 # Add this helper at the top of the file
@@ -397,9 +462,46 @@ def ensure_float32(tensor):
     return tensor
 
 # Instead of modifying the model, focus on ensuring input/output tensors are float32
-def get_model(model_name):
-    """Load MusicGen model and apply device settings."""
+def get_model(model_name, device_id=0):
+    """Load MusicGen model with kernel caching awareness."""
+    cache_key = kernel_cache.get_cache_key(model_name, device_id)
+    is_warmed = kernel_cache.has_warmed_kernels(model_name, device_id)
+    
+    if not is_warmed:
+        print(f"[KERNEL] First load of {model_name} - kernels will compile (expect slowdown)")
+    else:
+        print(f"[KERNEL] Kernels should be cached for {model_name} - expecting faster startup")
+    
     model = MusicGen.get_pretrained(model_name)
+    
+    # If this is first load, do a dummy forward pass to force kernel compilation
+    if not is_warmed:
+        print(f"[KERNEL] Warming up kernels for {model_name}...")
+        device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+        
+        # Create minimal dummy input
+        dummy_audio = torch.randn(1, 1, 16000).to(device=device, dtype=torch.float32)
+        
+        with torch.no_grad():
+            try:
+                # Do a minimal generation to compile kernels
+                model.set_generation_params(duration=1.0)
+                _ = model.generate_continuation(
+                    dummy_audio,
+                    prompt_sample_rate=32000,
+                    descriptions=None,
+                    progress=False
+                )
+                kernel_cache.mark_kernels_warmed(model_name, device_id)
+                print(f"[KERNEL] Kernel warmup complete for {model_name}")
+            except Exception as e:
+                print(f"[KERNEL] Warmup failed (non-fatal): {e}")
+        
+        # Clean up dummy tensors
+        del dummy_audio
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
     return model
 
 def safe_musicgen_continuation_v2(
@@ -412,16 +514,10 @@ def safe_musicgen_continuation_v2(
     device_id: int = 0
 ) -> torch.Tensor:
     """
-    Enhanced safe wrapper for MusicGen's generate_continuation with robust CUDA handling.
-    
-    This implementation:
-    1. Uses synchronized CUDA execution context
-    2. Forces consistent precision
-    3. Implements multiple recovery strategies
-    4. Handles memory explicitly between operations
-    5. Enforces proper mono audio format
+    Simplified safe wrapper for MusicGen's generate_continuation.
+    Handles retries for dtype errors without forced synchronization.
     """
-    # Always ensure input is float32
+    # Validate input type
     if not isinstance(prompt, torch.Tensor):
         raise TypeError(f"Expected prompt to be torch.Tensor, got {type(prompt)}")
     
@@ -468,8 +564,8 @@ def safe_musicgen_continuation_v2(
     print(f"✅ Final prompt shape for MusicGen: {prompt.shape}")
         
     # Force float32 and pin to device
-    prompt = prompt.to(device=f"cuda:{device_id}" if torch.cuda.is_available() else "cpu", 
-                       dtype=torch.float32)
+    device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+    prompt = prompt.to(device=device, dtype=torch.float32)
     
     # Try with retries for dtype errors
     attempt = 0
@@ -477,41 +573,34 @@ def safe_musicgen_continuation_v2(
     
     while attempt <= max_retries:
         try:
-            with cuda_execution_context(device_id):
-                # Extra cleanup between attempts
-                if attempt > 0:
-                    # Hard reset CUDA
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                    print(f"Retry attempt {attempt}/{max_retries} with enhanced CUDA control")
-                    
-                    # Force precision on critical modules if possible
-                    try:
-                        if hasattr(model, 'compression_model') and hasattr(model.compression_model, 'to'):
-                            model.compression_model = model.compression_model.to(torch.float32)
-                        if hasattr(model, 'lm') and hasattr(model.lm, 'to'):
-                            model.lm = model.lm.to(torch.float32)
-                    except Exception as e:
-                        print(f"Warning: Could not convert model components: {e}")
-                
-                # Call generation with guaranteed synchronization
-                output = model.generate_continuation(
-                    prompt,
-                    prompt_sample_rate=prompt_sample_rate,
-                    descriptions=descriptions,
-                    progress=progress
-                )
-                
-                # Immediate synchronization and conversion
+            # Lightweight cleanup between retries if needed
+            if attempt > 0:
+                print(f"Retry attempt {attempt}/{max_retries}")
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize(device_id)
+                    torch.cuda.empty_cache()  # Just clear cache, no sync
+                gc.collect()
                 
-                print(f"✅ Generated output shape: {output.shape}")
-                
-                # Success! Convert to float32 explicitly
-                return output.to(dtype=torch.float32)
+                # Try to force float32 on model components (for dtype errors)
+                try:
+                    if hasattr(model, 'compression_model') and hasattr(model.compression_model, 'to'):
+                        model.compression_model = model.compression_model.to(torch.float32)
+                    if hasattr(model, 'lm') and hasattr(model.lm, 'to'):
+                        model.lm = model.lm.to(torch.float32)
+                except Exception as e:
+                    print(f"Warning: Could not convert model components: {e}")
+            
+            # Call generation - let PyTorch handle CUDA async
+            output = model.generate_continuation(
+                prompt,
+                prompt_sample_rate=prompt_sample_rate,
+                descriptions=descriptions,
+                progress=progress
+            )
+            
+            print(f"✅ Generated output shape: {output.shape}")
+            
+            # Success! Return as float32
+            return output.to(dtype=torch.float32)
                 
         except RuntimeError as e:
             error_msg = str(e)
@@ -521,9 +610,8 @@ def safe_musicgen_continuation_v2(
             if "Expected scalar type Float but found Half" in error_msg:
                 attempt += 1
                 if attempt <= max_retries:
-                    # Extra logging
-                    print(f"Caught dtype error in generate_continuation: {error_msg}")
-                    print(f"Attempting advanced recovery (try {attempt}/{max_retries})...")
+                    print(f"Caught dtype error: {error_msg}")
+                    print(f"Will retry with model component conversion...")
                     continue
                 else:
                     # Exhausted retries
@@ -534,11 +622,8 @@ def safe_musicgen_continuation_v2(
     
     # If we get here, we've exhausted retries
     if last_error:
-        print(f"Failed after {max_retries} retries with enhanced CUDA control. Error: {str(last_error)}")
+        print(f"Failed after {max_retries} retries. Error: {str(last_error)}")
         raise last_error
-    
-    # This should never happen
-    return output.to(torch.float32)
 
 
 # Example initialization in your main script
@@ -630,83 +715,73 @@ def _process_audio_impl_v2(
     description: Optional[str] = None,
     device_id: int = 0
 ) -> str:
+    """
+    Simplified implementation - single context, let PyTorch manage CUDA.
+    """
     model = None
     try:
         # Load and validate input
         song, sr = load_and_validate_audio(input_data_base64)
         
-        with tensor_lifecycle() as track_tensor:
-            # Force float32 and device
+        # Use enforced_dtype_context for dtype consistency
+        with enforced_dtype_context():
+            # Setup device
             device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
-            song = track_tensor(song.to(device=device, dtype=torch.float32))
             
-            # STEP 1: Convert to mono FIRST (before resampling)
-            if song.size(0) == 2:
-                # Convert stereo to mono by averaging channels
-                song_mono = track_tensor((song[0:1] + song[1:2]) / 2.0)
-            elif song.size(0) > 2:
-                # Take first channel if more than 2 channels
-                song_mono = track_tensor(song[0:1])
-            else:
-                # Already mono
-                song_mono = track_tensor(song.to(dtype=torch.float32))
+            # Process audio with explicit dtype
+            song = song.to(device=device, dtype=torch.float32)
             
-            # STEP 2: Now resample the mono audio
+            # Resample to model's sample rate
+            song_resampled = resample_for_model(song, sr, config.target_sr)
+            
+            # Preprocess the audio
+            processed_waveform = preprocess_audio(song_resampled)
+            
+            # Wrap/pad audio if needed to ensure sufficient length
+            wrapped_waveform = wrap_audio_if_needed(
+                processed_waveform,
+                config.target_sr,
+                config.prompt_duration + config.output_duration
+            )
+            
+            # FIX: Take the FIRST X seconds as prompt (not the last!)
+            prompt_waveform = wrapped_waveform[..., :int(config.prompt_duration * config.target_sr)]
+            
+            # Initialize model
+            model = MusicGen.get_pretrained(model_name)
+            if progress_callback:
+                model.set_custom_progress_callback(progress_callback)
+            
+            model.set_generation_params(
+                use_sampling=True,
+                top_k=config.top_k,
+                top_p=0.0,
+                temperature=config.temperature,
+                duration=config.output_duration,
+                cfg_coef=config.cfg_coef
+            )
+            
+            final_description = get_model_description(model_name, description)
+            
+            # Generate - safe_musicgen_continuation_v2 handles retries
+            output = safe_musicgen_continuation_v2(
+                model,
+                prompt_waveform,
+                prompt_sample_rate=config.target_sr,
+                descriptions=[final_description] if final_description else None,
+                progress=True,
+                device_id=device_id
+            )
+            
+            if output is None or output.size(0) == 0:
+                raise AudioProcessingError("Generated output is empty")
+            
+            # Resample output back to original sample rate if needed
             if sr != config.target_sr:
-                song_resampled = track_tensor(resample_for_model(song_mono, sr, config.target_sr).to(dtype=torch.float32))
-            else:
-                song_resampled = track_tensor(song_mono.to(dtype=torch.float32))
+                output = resample_for_model(output, config.target_sr, sr)
             
-            # STEP 3: Continue with mono audio processing
-            processed_waveform = track_tensor(preprocess_audio(song_resampled).to(dtype=torch.float32))
-            
-            wrapped_waveform = track_tensor(
-                wrap_audio_if_needed(
-                    processed_waveform, 
-                    config.target_sr,
-                    config.prompt_duration + config.output_duration
-                ).to(dtype=torch.float32)
-            )
-            
-            prompt_waveform = track_tensor(
-                wrapped_waveform[..., :int(config.prompt_duration * config.target_sr)].to(dtype=torch.float32)
-            )
-            
-            with cuda_execution_context(device_id):
-                # Initialize model
-                model = MusicGen.get_pretrained(model_name)
-                if progress_callback:
-                    model.set_custom_progress_callback(progress_callback)
-                
-                model.set_generation_params(
-                    use_sampling=True,
-                    top_k=config.top_k,
-                    top_p=0.0,
-                    temperature=config.temperature,
-                    duration=config.output_duration,
-                    cfg_coef=config.cfg_coef
-                )
-                
-                final_description = get_model_description(model_name, description)
-                
-                # Use enhanced implementation
-                output = track_tensor(safe_musicgen_continuation_v2(
-                    model,
-                    prompt_waveform,
-                    prompt_sample_rate=config.target_sr,
-                    descriptions=[final_description] if final_description else None,
-                    progress=True,
-                    device_id=device_id
-                ))
-                
-                if output is None or output.size(0) == 0:
-                    raise AudioProcessingError("Generated output is empty")
-                
-                # Explicit dtype management
-                output = track_tensor(output.to(dtype=torch.float32))
-                
-                # Return at target sample rate (32kHz)
-                return save_audio_to_base64(output.squeeze(0), config.target_sr)
+            # Return as base64 - output already includes the prompt + continuation
+            return save_audio_to_base64(output.squeeze(0).cpu(), sr)
     
     except Exception as e:
         error_msg = f"Audio processing failed: {str(e)}"
@@ -714,11 +789,15 @@ def _process_audio_impl_v2(
         raise AudioProcessingError(error_msg) from e
     
     finally:
+        # Cleanup model
         if model is not None:
             del model
-        ResamplerPool().clear()
-        with resource_cleanup():
-            pass
+        aggressive_cpu_cleanup()  # ← Use this instead of clean_gpu_memory()
+        
+        # Lightweight cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 
 # Similarly update _continue_music_impl to use the wrapper
@@ -730,89 +809,82 @@ def _continue_music_impl_v2(
     description: Optional[str] = None,
     device_id: int = 0
 ) -> str:
+    """
+    Simplified music continuation implementation.
+    Single context, no forced synchronization, let PyTorch manage CUDA.
+    """
     model = None
     try:
         # Load and validate input
         song, sr = load_and_validate_audio(input_data_base64)
         
-        with tensor_lifecycle() as track_tensor:
-            # Force float32 and explicit device
+        # Use enforced_dtype_context for dtype consistency
+        with enforced_dtype_context():
+            # Setup device
             device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
-            song = track_tensor(song.to(device=device, dtype=torch.float32))
             
-            # Ensure stereo with explicit dtype
+            # Force float32 and move to device
+            song = song.to(device=device, dtype=torch.float32)
+            
+            # Ensure stereo
             if song.size(0) == 1:
-                song = track_tensor(song.repeat(2, 1).to(dtype=torch.float32))
+                song = song.repeat(2, 1).to(dtype=torch.float32)
             
-            # Resample with explicit dtype handling
-            song_resampled = track_tensor(resample_for_model(song, sr).to(dtype=torch.float32))
+            # Resample to model's sample rate
+            song_resampled = resample_for_model(song, sr, config.target_sr).to(dtype=torch.float32)
             
-            # Get prompt with explicit dtype
-            prompt_waveform = track_tensor(
-                song_resampled[..., -int(config.prompt_duration * config.target_sr):].to(dtype=torch.float32)
+            # Extract prompt from the end of the audio
+            prompt_waveform = song_resampled[..., -int(config.prompt_duration * config.target_sr):].to(dtype=torch.float32)
+            
+            # Initialize model
+            model = MusicGen.get_pretrained(model_name)
+            if progress_callback:
+                model.set_custom_progress_callback(progress_callback)
+            
+            model.set_generation_params(
+                use_sampling=True,
+                top_k=config.top_k,
+                top_p=0.0,
+                temperature=config.temperature,
+                duration=config.output_duration,
+                cfg_coef=config.cfg_coef
             )
             
-            with cuda_execution_context(device_id):
-                # Initialize model in controlled context
-                model = MusicGen.get_pretrained(model_name)
-                if progress_callback:
-                    model.set_custom_progress_callback(progress_callback)
-                
-                model.set_generation_params(
-                    use_sampling=True,
-                    top_k=config.top_k,
-                    top_p=0.0,
-                    temperature=config.temperature,
-                    duration=config.output_duration,
-                    cfg_coef=config.cfg_coef
-                )
-                
-                final_description = get_model_description(model_name, description)
-                
-                print(f"Generating continuation with description: {final_description}")
-                
-                # Use enhanced implementation with CUDA control
-                output = track_tensor(safe_musicgen_continuation_v2(
-                    model,
-                    prompt_waveform,
-                    prompt_sample_rate=config.target_sr,
-                    descriptions=[final_description] if final_description else None,
-                    progress=True,
-                    device_id=device_id
-                ))
-                
-                # Explicit dtype and shape management
-                output = track_tensor(output.to(dtype=torch.float32))
-                output = track_tensor(
-                    output.squeeze(0) if output.dim() == 3 else output
-                )
-                
-                # Resample if needed with explicit dtype
-                if sr != config.target_sr:
-                    output = track_tensor(
-                        resample_for_model(output, config.target_sr, sr).to(dtype=torch.float32)
-                    )
-                
-                # Handle original audio with explicit dtype
-                original_minus_prompt = track_tensor(
-                    song[..., :-int(config.prompt_duration * sr)].to(dtype=torch.float32)
-                )
-                
-                # Match channels with explicit dtype
-                if original_minus_prompt.size(0) != output.size(0):
-                    output = track_tensor(
-                        output.repeat(original_minus_prompt.size(0), 1).to(dtype=torch.float32)
-                    )
-                
-                # Combine audio with explicit device and dtype
-                combined_waveform = track_tensor(
-                    torch.cat([original_minus_prompt, output], dim=1)
-                    .to(device=device, dtype=torch.float32)
-                )
-                
-                # Final explicit conversion
-                combined_waveform = combined_waveform.to(dtype=torch.float32)
-                return save_audio_to_base64(combined_waveform, sr)
+            final_description = get_model_description(model_name, description)
+            
+            print(f"Generating continuation with description: {final_description}")
+            
+            # Generate continuation - safe_musicgen_continuation_v2 handles retries
+            output = safe_musicgen_continuation_v2(
+                model,
+                prompt_waveform,
+                prompt_sample_rate=config.target_sr,
+                descriptions=[final_description] if final_description else None,
+                progress=True,
+                device_id=device_id
+            )
+            
+            # Ensure output is float32 and proper shape
+            output = output.to(dtype=torch.float32)
+            if output.dim() == 3:
+                output = output.squeeze(0)
+            
+            # Resample output back to original sample rate if needed
+            if sr != config.target_sr:
+                output = resample_for_model(output, config.target_sr, sr).to(dtype=torch.float32)
+            
+            # Get the original audio minus the prompt section
+            original_minus_prompt = song[..., :-int(config.prompt_duration * sr)].to(dtype=torch.float32)
+            
+            # Match channels between original and generated
+            if original_minus_prompt.size(0) != output.size(0):
+                output = output.repeat(original_minus_prompt.size(0), 1).to(dtype=torch.float32)
+            
+            # Combine original audio (minus prompt) with generated continuation
+            combined_waveform = torch.cat([original_minus_prompt, output], dim=1).to(dtype=torch.float32)
+            
+            # Return as base64
+            return save_audio_to_base64(combined_waveform, sr)
     
     except Exception as e:
         error_msg = f"Music continuation failed: {str(e)}"
@@ -820,11 +892,17 @@ def _continue_music_impl_v2(
         raise AudioProcessingError(error_msg) from e
     
     finally:
+        # Cleanup model
         if model is not None:
             del model
-        ResamplerPool().clear()
-        with resource_cleanup():
-            pass
+        
+        aggressive_cpu_cleanup()  # ← Use this instead of clean_gpu_memory()
+        
+        # Lightweight cleanup - no forced synchronization
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
 
 # Backwards compatibility wrappers
 def process_audio(

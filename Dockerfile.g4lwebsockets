@@ -27,6 +27,14 @@ RUN apt-get update && apt-get install -y \
     libatlas-base-dev \
     libblas-dev \
     liblapack-dev \
+    pkg-config \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pip for Python 3.9
@@ -60,6 +68,8 @@ COPY audiocraft /usr/src/app/audiocraft
 COPY g4lwebsockets.py /usr/src/app/
 COPY g4laudio.py /usr/src/app/
 COPY utils.py /usr/src/app/
+COPY warmup.py /usr/src/app/
+COPY model_cache.py /usr/src/app/
 
 # Copy entrypoint.sh and make it executable
 COPY entrypoint.sh /usr/src/app/entrypoint.sh

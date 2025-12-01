@@ -36,6 +36,8 @@ from utils import parse_client_data
 
 import uuid
 
+from warmup import warmup_bp
+
 class ThreadManager:
     """Manages active processing threads and ensures cleanup."""
     def __init__(self):
@@ -95,14 +97,28 @@ class ProcessTracker:
 
 @contextmanager
 def track_processes():
-    """Context manager for process tracking."""
+    """Track and cleanup spawned processes."""
     tracker = ProcessTracker()
     tracker.start_tracking()
     try:
         yield
     finally:
         tracker.cleanup_new_processes()
-        clean_gpu_memory()
+        # Lightweight cleanup only
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+@contextmanager
+def melodyflow_track_processes():
+    """Lightweight tracker for MelodyFlow bridge tasks."""
+    tracker = ProcessTracker()
+    tracker.start_tracking()
+    try:
+        yield
+    finally:
+        tracker.cleanup_new_processes()
+        melodyflow_cleanup()
 
 def enhanced_spawn(func):
     """Wrapper for gevent.spawn that ensures proper cleanup."""
@@ -112,34 +128,22 @@ def enhanced_spawn(func):
 
 @contextmanager
 def force_gpu_cleanup():
-    """Enhanced GPU cleanup context manager."""
+    """Lightweight cleanup context - no forced synchronization."""
     try:
         yield
     finally:
-        # Force release of all GPU memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # Synchronize all CUDA devices
-            torch.cuda.synchronize()
-        # Force garbage collection
         gc.collect()
 
 def clean_gpu_memory():
-    """Utility function to force GPU memory cleanup."""
+    """Simplified GPU memory cleanup - lightweight, no forced synchronization."""
     if torch.cuda.is_available():
-        # Empty the cache first
         torch.cuda.empty_cache()
-        
-        # Get all active GPU devices
-        devices = range(torch.cuda.device_count())
-        for device in devices:
-            with torch.cuda.device(device):
-                # Synchronize the device to ensure all operations are complete
-                torch.cuda.synchronize()
-                # Empty the cache again after sync
-                torch.cuda.empty_cache()
-    
-    # Force garbage collection multiple times
+    gc.collect()
+
+def melodyflow_cleanup():
+    """Lightweight cleanup for MelodyFlow bridge interactions."""
     for _ in range(3):
         gc.collect()
 
@@ -170,8 +174,10 @@ socketio = SocketIO(
     ping_timeout=240,  # Use snake_case
     ping_interval=120,  # Use snake_case
     max_http_buffer_size=64*1024*1024,
-    ping_timeout_callback=lambda: clean_gpu_memory(),  # Add cleanup on ping timeout
+   # ping_timeout_callback=lambda: clean_gpu_memory(),  # this may be excessive dude.
 )
+
+app.register_blueprint(warmup_bp)
 
 @app.route('/')
 def index():
@@ -1044,7 +1050,7 @@ def handle_task_notification():
 def handle_audio_processing(data):
     try:
         # Basic cleanup
-        clean_gpu_memory()
+        # clean_gpu_memory() maybe not needed bro.
         thread_manager.cleanup_threads()
         
         # Parse and clean client data
@@ -1280,7 +1286,7 @@ def handle_task_ready(session_id):
 @socketio.on('continue_music_request')
 def handle_continue_music(data):
     try:
-        clean_gpu_memory()
+        # clean_gpu_memory() maybe not needed bro.
         thread_manager.cleanup_threads()
         
         try:
@@ -1543,7 +1549,7 @@ def handle_task_ready_continue(session_id):
 @socketio.on('retry_music_request')
 def handle_retry_music(data):
     try:
-        clean_gpu_memory()
+        # clean_gpu_memory() maybe not needed bro.
         thread_manager.cleanup_threads()
         
         # Handle string data (from Swift)
@@ -2035,10 +2041,13 @@ def cleanup_temp_file(file_path):
     except Exception as e:
         print(f"Error cleaning up temp file {file_path}: {e}")
 
+
+
+
 @socketio.on('transform_audio_request')
 def handle_transform_audio(data):
     try:
-        clean_gpu_memory()
+        # clean_gpu_memory()
         thread_manager.cleanup_threads()
         data = parse_client_data(data)
 
@@ -2130,7 +2139,18 @@ def handle_task_ready_transform(session_id):
         
         # Set transform in progress in Redis AND store status for HTTP clients
         set_transform_in_progress(session_id, True)
-        store_session_status(session_id, 'processing')  # NEW: For HTTP clients
+        store_session_status(session_id, 'warming')  # Changed from 'processing' to 'warming'
+        
+        # NEW: Emit warming status BEFORE calling MelodyFlow (like audio generation does)
+        store_queue_status_update(session_id, {
+            'status': 'warming',
+            'message': 'loading MelodyFlow model (first run / hub download)',
+            'position': 0,
+            'total_queued': 0,
+            'estimated_time': None,
+            'estimated_seconds': 0,
+            'from_worker': True,
+        })
         
         # Notify Go service that task is now processing
         requests.post(
@@ -2145,16 +2165,19 @@ def handle_task_ready_transform(session_id):
             flask_socket = None
             temp_output_file = None
             try:
-                with track_processes():
+                with melodyflow_track_processes():  # Use lighter cleanup
+                    published_processing = False  # NEW: Track if we've switched to processing status
                     
                     def context_emit(event, data):
                         smart_emit(event, data, room=session_id)
 
                     print(f"[DEBUG] Starting transform_audio_thread for session {session_id}")
-                    flask_socket = Client(reconnection=True, reconnection_attempts=5, reconnection_delay=1)
+                    
 
-                    @flask_socket.on('progress')
+
                     def handle_progress(data):
+                        nonlocal published_processing  # NEW: Access the flag
+                        
                         if data.get('session_id') == session_id:
                             progress_percent = data.get('progress', 0)
                             
@@ -2166,10 +2189,20 @@ def handle_task_ready_transform(session_id):
                             
                             # NEW: Store for HTTP clients
                             store_session_progress(session_id, int(progress_percent))
-
-                    print(f"[DEBUG] Connecting to MelodyFlow WebSocket for session {session_id}")
-                    flask_socket.connect('http://melodyflow:8002', wait_timeout=30)
-                    print(f"[DEBUG] Connected to MelodyFlow WebSocket")
+                            
+                            # NEW: On first progress update, flip from warming to processing
+                            if not published_processing and progress_percent > 0:
+                                store_queue_status_update(session_id, {
+                                    'status': 'processing',
+                                    'message': 'transforming audio…',
+                                    'position': 0,
+                                    'total_queued': 0,
+                                    'estimated_time': None,
+                                    'estimated_seconds': 0,
+                                    'from_worker': True,
+                                })
+                                store_session_status(session_id, 'processing')
+                                published_processing = True
 
                     # Prepare request payload with file path instead of base64
                     request_payload = {
@@ -2192,7 +2225,8 @@ def handle_task_ready_transform(session_id):
                     print(f"[DEBUG] Sending transform request to MelodyFlow for session {session_id}")
                     response = requests.post(
                         'http://melodyflow:8002/transform',
-                        json=request_payload
+                        json=request_payload,
+                        timeout=300  # 5 minute timeout
                     )
                     print(f"[DEBUG] Received transform response: status={response.status_code}")
                     
@@ -2300,7 +2334,7 @@ def handle_task_ready_transform(session_id):
                     cleanup_temp_file(temp_output_file)
                     
                 set_transform_in_progress(session_id, False)
-                clean_gpu_memory()
+               # clean_gpu_memory()
                 thread_manager.cleanup_threads()
 
         enhanced_spawn(transform_audio_thread)

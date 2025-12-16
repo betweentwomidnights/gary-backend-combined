@@ -594,6 +594,130 @@ def juce_poll_status(session_id):
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+    
+@app.route('/api/models', methods=['GET'])
+def get_available_models():
+    """
+    Return available models organized by size with automatic checkpoint grouping.
+    Models following the pattern 'name-size-epoch' are automatically grouped.
+    """
+    try:
+        # Define your models - easy to update as you add new ones
+        models = {
+            'small': [
+                'thepatch/vanya_ai_dnb_0.1',
+                'thepatch/gary_orchestra_2',
+                'thepatch/keygen-gary-v2-small-8',
+                'thepatch/keygen-gary-v2-small-12',
+                'thepatch/keygen-gary-small-6',
+                'thepatch/keygen-gary-small-12',
+                'thepatch/keygen-gary-small-20',  # Your upcoming one
+            ],
+            'medium': [
+                'thepatch/bleeps-medium',
+                'thepatch/keygen-gary-medium-12',
+            ],
+            'large': [
+                'thepatch/hoenn_lofi',
+                'thepatch/bleeps-large-6',
+                'thepatch/bleeps-large-8',
+                'thepatch/bleeps-large-10',
+                'thepatch/bleeps-large-14',
+                'thepatch/bleeps-large-20',
+                'thepatch/keygen-gary-large-6',
+                'thepatch/keygen-gary-large-12',
+                'thepatch/keygen-gary-large-20',
+                'thepatch/keygen-gary-v2-large-12',
+                'thepatch/keygen-gary-v2-large-16',
+            ]
+        }
+        
+        def parse_model_info(model_path):
+            """Extract base name and checkpoint info from model path"""
+            # Remove the 'thepatch/' prefix
+            name = model_path.split('/')[-1]
+            
+            # Try to extract checkpoint number from end (e.g., 'bleeps-large-6' -> 6)
+            parts = name.rsplit('-', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return {
+                    'full_path': model_path,
+                    'display_name': name,
+                    'base_name': parts[0],
+                    'checkpoint': int(parts[1]),
+                    'has_checkpoint': True
+                }
+            else:
+                # Legacy models without checkpoint numbers
+                return {
+                    'full_path': model_path,
+                    'display_name': name,
+                    'base_name': name,
+                    'checkpoint': None,
+                    'has_checkpoint': False
+                }
+        
+        def group_models(model_list):
+            """Group models by base name, with checkpoints as nested items"""
+            parsed = [parse_model_info(m) for m in model_list]
+            
+            # Group by base_name
+            grouped = {}
+            for model in parsed:
+                base = model['base_name']
+                if base not in grouped:
+                    grouped[base] = []
+                grouped[base].append(model)
+            
+            # Build result structure
+            result = []
+            for base_name, models_group in grouped.items():
+                if len(models_group) == 1 and not models_group[0]['has_checkpoint']:
+                    # Single model without checkpoint - don't nest
+                    result.append({
+                        'name': models_group[0]['display_name'],
+                        'path': models_group[0]['full_path'],
+                        'type': 'single'
+                    })
+                else:
+                    # Multiple checkpoints or single checkpoint - create group
+                    checkpoints = sorted(
+                        [m for m in models_group if m['has_checkpoint']], 
+                        key=lambda x: x['checkpoint']
+                    )
+                    result.append({
+                        'name': base_name,
+                        'type': 'group',
+                        'checkpoints': [
+                            {
+                                'name': f"{base_name}-{c['checkpoint']}",
+                                'path': c['full_path'],
+                                'epoch': c['checkpoint']
+                            }
+                            for c in checkpoints
+                        ]
+                    })
+            
+            return result
+        
+        # Process each size category
+        response = {
+            'small': group_models(models['small']),
+            'medium': group_models(models['medium']),
+            'large': group_models(models['large'])
+        }
+        
+        return jsonify({
+            'success': True,
+            'models': response,
+            'updated_at': datetime.now(timezone.utc).isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 # =============================================================================

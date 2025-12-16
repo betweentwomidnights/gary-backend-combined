@@ -6,7 +6,7 @@ set -e
 
 # Execute the gunicorn command
 exec gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
-    -w 5 \
+    -w 3 \
     --worker-connections 1000 \
     -t 600 \
     --graceful-timeout 60 \

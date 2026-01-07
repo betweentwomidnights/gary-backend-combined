@@ -1,5 +1,4 @@
-# Use a CUDA-enabled base image with Ubuntu 20.04
-FROM nvidia/cuda:11.7.1-cudnn8-runtime-ubuntu20.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 # Set environment variable to prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,12 +13,11 @@ ENV XDG_CACHE_HOME=/app/.cache
 # Set the working directory
 WORKDIR /usr/src/app
 
-# Install necessary system packages including Python build tools
+# Install necessary system packages
 RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    python3.9 \
-    python3.9-distutils \
-    python3.9-dev \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
     build-essential \
     gfortran \
     wget \
@@ -37,32 +35,24 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pip for Python 3.9
-RUN wget https://bootstrap.pypa.io/get-pip.py && python3.9 get-pip.py && rm get-pip.py
+# Upgrade pip, setuptools and wheel
+RUN python3.10 -m pip install --upgrade pip setuptools wheel
 
-# Install setuptools and wheel
-RUN python3.9 -m pip install --upgrade pip setuptools wheel
-
-# Install numpy using a later version (or try with 1.24.0)
-RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
+# Install numpy first
+RUN python3.10 -m pip install numpy==1.24.0 --prefer-binary
 
 # Copy the requirements file into the container
 COPY requirements-g4lwebsockets.txt ./requirements-g4lwebsockets.txt
 
 # Install Python dependencies from requirements-g4lwebsockets.txt
-RUN python3.9 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt psutil
-
-RUN python3.9 -m pip install numpy==1.24.0 --prefer-binary
+RUN python3.10 -m pip install --no-cache-dir -r requirements-g4lwebsockets.txt psutil
 
 # Verify gunicorn installation and list installed packages
-RUN python3.9 -m pip show gunicorn
-RUN python3.9 -m pip list
+RUN python3.10 -m pip show gunicorn
+RUN python3.10 -m pip list
 
 # Copy the entire audiocraft folder (if applicable)
 COPY audiocraft /usr/src/app/audiocraft
-
-# Copy the current directory contents (excluding audiocraft which is already copied)
-# COPY . .
 
 # Copy only the specific Python files we need
 COPY g4lwebsockets.py /usr/src/app/
